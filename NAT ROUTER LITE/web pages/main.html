@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAT Router</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #0f0f0f;
+            color: #ffffff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            max-width: 350px;
+            width: 80%;
+            min-width: 270px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #1f1f1f;
+            border-radius: 20px;
+            box-shadow: 10px 10px 15px rgba(0, 0, 0, 0.5);
+        }
+
+        h1 {
+            margin: 0;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            width: 100%;
+        }
+
+        label {
+            font-size: 1.2em;
+        }
+
+        input {
+            padding: 10px;
+            font-size: 1em;
+            border: 0px solid transparent;
+            border-radius: 10px;
+            background-color: #2f2f2f;
+            color: #ffffff;
+        }
+
+        input:focus {
+            outline: none;
+            background-color: #3f3f3f;
+            border: 0px solid transparent;
+        }
+
+        input[type="submit"] {
+            margin-top: 15px;
+            align-self: center;
+            width: 130px;
+            background-image: linear-gradient(315deg, #20fb3a, #00e61f);
+            color: #00330c;
+            cursor: pointer;
+            border: none;
+        }
+
+        input[type="submit"]:hover {
+            background-image: linear-gradient(315deg, #00e61f, #00b51e);
+        }
+
+        input[type="submit"]:active {
+            background-image: linear-gradient(315deg, #00b51e, #028919);
+        }
+
+        /* Estilos para el autocompletado */
+        input:-webkit-autofill {
+            background-color: #2f2f2f !important;
+            -webkit-text-fill-color: #ffffff !important;
+            box-shadow: 0px 0px 0px 1000px #2f2f2f inset !important;
+            border: 1px solid #20fb3a !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Wi-Fi</h1>
+        <form method="POST">
+            <label for="ssid">SSID:</label>
+            <input type="text" id="ssid" name="ssid" placeholder="Nombre de la red" required>
+
+            <label for="password">Clave WPA:</label>
+            <input type="password" id="password" name="password" placeholder="Contraseña" minlength="8" required>
+
+            <input type="submit" value="Conectar">
+        </form>
+    </div>
+</body>
+
+</html>
