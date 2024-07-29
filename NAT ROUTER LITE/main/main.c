@@ -463,8 +463,7 @@ static void wifi_start(void)
 
     // Registra el manejador de eventos de WiFi
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     // Inicializa el controlador WiFi
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
