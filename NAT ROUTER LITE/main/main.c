@@ -42,7 +42,7 @@
 // Definiciones WiFi AP
 #define WIFI_AP_SSID "ESP32-NAT"
 #define WIFI_AP_PASS "12345678"
-#define WIFI_AP_MAX_STA_CONN 4
+#define WIFI_AP_MAX_STA_CONN 2
 #define WIFI_AP_CHANNEL 0
 #define WIFI_AP_IP "192.168.2.1" // También se usa como gateway (Netmask: 255.255.255.0)
 
@@ -92,10 +92,13 @@ static void get_wifi_credentials(char **ssid, char **password);                 
 static void configure_http_server(void);                                                                         // Configura el servidor HTTP
 static void toggle_pin(digital_pin *pin);                                                                        // Cambia el estado de un pin GPIO
 
-// Declaración de funciones de eventos
+// Declaración de funciones de eventos en el WiFi
+static void handle_sta_disconnected_event(wifi_event_sta_disconnected_t *event);    // Manejador de eventos de desconexión del cliente WiFi
+static void handle_no_ap_found_in_authmode_threshold(void);                         // Manejador de eventos de no encontrar AP en el umbral de autenticación
+static void handle_common_sta_disconnect_event(void);                               // Manejador de eventos comunes de desconexión del cliente WiFi
+static void handle_ip_event_sta_got_ip(void);                                       // Manejador de eventos de obtención de dirección IP del cliente WiFi
 static void wifi_reconnect(void);                                                   // Reintenta la conexión WiFi
 static void ap_set_dns_addr(esp_netif_t *esp_netif_ap, esp_netif_t *esp_netif_sta); // Establece la dirección DNS en el punto de acceso
-static void save_wifi_credentials(char *ssid, char *password);                      // Obtiene las credenciales de WiFi del almacenamiento no volátil
 
 // Declaración de manejadores del web server
 static esp_err_t main_handler(httpd_req_t *req);    // Manejador de la página principal
@@ -103,11 +106,14 @@ static esp_err_t favicon_handler(httpd_req_t *req); // Manejador del favicon
 static esp_err_t post_handler(httpd_req_t *req);    // Manejador de la petición POST
 
 // Declaración de funciones del web server
-static void url_decode(char *dst, const char *src); // Decodifica una URL
+static void url_decode(char *dst, const char *src);            // Decodifica una URL
+static void save_wifi_credentials(char *ssid, char *password); // Obtiene las credenciales de WiFi del almacenamiento no volátil
 
 // Paginas web
 extern const uint8_t main_html_start[] asm("_binary_main_html_start");
 extern const uint8_t main_html_end[] asm("_binary_main_html_end");
+
+// Imagenes e iconos
 extern const uint8_t router_ico_start[] asm("_binary_router_ico_start");
 extern const uint8_t router_ico_end[] asm("_binary_router_ico_end");
 
@@ -124,25 +130,19 @@ static void reconnect_cb(void *arg)
 // MARK: EVENTOS -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-
     if (event_base == WIFI_EVENT)
     {
         switch (event_id)
         {
-        // Eventos de WiFi
         case WIFI_EVENT_HOME_CHANNEL_CHANGE:
         {
             wifi_event_home_channel_change_t *event = (wifi_event_home_channel_change_t *)event_data;
             ESP_LOGI(TAG_WIFI, "Cambio de canal. Anterior: %d, Nuevo: %d", event->old_chan, event->new_chan);
             break;
         }
-
-        // Eventos de WiFi AP
         case WIFI_EVENT_AP_START:
-
             ESP_LOGI(TAG_AP, "Punto de acceso WiFi iniciado");
             break;
-
         case WIFI_EVENT_AP_PROBEREQRECVED:
         {
             wifi_event_ap_probe_req_rx_t *event = (wifi_event_ap_probe_req_rx_t *)event_data;
@@ -162,13 +162,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             break;
         }
         case WIFI_EVENT_AP_STOP:
-
             ESP_LOGI(TAG_AP, "Punto de acceso WiFi detenido");
             break;
-
-        // Eventos de WiFi STA
         case WIFI_EVENT_STA_START:
-
             ESP_LOGI(TAG_STA, "Cliente WiFi iniciado, conectando a la red...");
             esp_err_t err = esp_wifi_connect();
             if (err != ESP_OK)
@@ -176,7 +172,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGE(TAG_STA, "Error al conectar al WiFi. Error %s", esp_err_to_name(err));
             }
             break;
-
         case WIFI_EVENT_STA_CONNECTED:
         {
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
@@ -187,85 +182,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         case WIFI_EVENT_STA_DISCONNECTED:
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-            ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en coneccion. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
+            ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
             esp_connected = false;
 
-            // Maneja la razón de la desconexión
-            switch (event->reason)
-            {
-            case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
-            {
-                if (auth_mode_index < WIFI_AUTH_MAX)
-                {
-                    // Cambia el modo de autenticación al siguiente en la lista
-                    wifi_config_t wifi_config;
-                    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
-
-                    wifi_config.sta.threshold.authmode = (wifi_auth_mode_t)auth_mode_index;
-                    auth_mode_index++;
-
-                    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-                    // Reinicia la conexión WiFi
-                    ESP_ERROR_CHECK(esp_wifi_disconnect());
-                    ESP_ERROR_CHECK(esp_wifi_connect());
-                }
-                else
-                {
-                    ESP_LOGW(TAG_STA, "Todos los modos de autenticación han sido probados.");
-                    auth_mode_index = 0; // Reiniciar el índice para futuros intentos
-                }
-            }
-                break;
-            case WIFI_REASON_NO_AP_FOUND:
-            {
-                wifi_config_t wifi_config;
-                ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
-
-                get_wifi_credentials(&ssid, &password);
-                strcpy((char *)wifi_config.sta.ssid, ssid);
-                strcpy((char *)wifi_config.sta.password, password);
-
-                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-                wifi_reconnect();
-                break;
-            }
-            case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-            case WIFI_REASON_CONNECTION_FAIL:
-            {
-                wifi_config_t wifi_config;
-                ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
-
-                get_wifi_credentials(&ssid, &password);
-                strcpy((char *)wifi_config.sta.ssid, ssid);
-                strcpy((char *)wifi_config.sta.password, password);
-
-                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-                wifi_reconnect();
-                break;
-            }
-            default:
-                ESP_LOGW(TAG_STA, "Razón de desconexión no manejada: %d", event->reason);
-                wifi_reconnect();
-                break;
-            }
+            handle_sta_disconnected_event(event);
             break;
         }
-
+        case WIFI_EVENT_STA_BEACON_TIMEOUT:
+            ESP_LOGW(TAG_STA, "Tiempo de espera de beacon agotado");
+            break;
         case WIFI_EVENT_STA_STOP:
-
             ESP_LOGI(TAG_STA, "Cliente WiFi detenido");
             break;
-
         default:
-            ESP_LOGW(TAG_WIFI, "Evento no manejado: %ld", event_id);
+            ESP_LOGW(TAG_WIFI, "Evento no manejado en WIFI: %ld", event_id);
             break;
         }
     }
-
-    if (event_base == IP_EVENT)
+    else if (event_base == IP_EVENT)
     {
         switch (event_id)
         {
@@ -274,30 +208,115 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
             ESP_LOGI(TAG_STA, "Dirección IP asignada. IP: " IPSTR ", Máscara: " IPSTR ", Gateway: " IPSTR, IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask), IP2STR(&event->ip_info.gw));
 
-            // Establece la dirección DNS en el punto de acceso
-            ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
-
-            // Establece la interfaz de red por defecto
-            esp_err_t err = esp_netif_set_default_netif(esp_netif_sta);
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
-            }
-
-            // Habilita el NAT en la interfaz de red del punto de acceso
-            err = esp_netif_napt_enable(esp_netif_ap);
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
-            }
+            handle_ip_event_sta_got_ip();
             break;
         }
-
+        case IP_EVENT_STA_LOST_IP:
+            ESP_LOGW(TAG_STA, "Dirección IP perdida");
+            break;
+        case IP_EVENT_AP_STAIPASSIGNED:
+        {
+            ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+            ESP_LOGI(TAG_AP, "Dirección IP asignada al cliente. IP: " IPSTR ", MAC: " MACSTR, IP2STR(&event->ip), MAC2STR(event->mac));
+            break;
+        }
         default:
-            ESP_LOGW(TAG_WIFI, "Evento no manejado: %ld", event_id);
+            ESP_LOGW(TAG_WIFI, "Evento no manejado en IP: %ld", event_id);
             break;
         }
     }
+}
+
+static void handle_sta_disconnected_event(wifi_event_sta_disconnected_t *event)
+{
+    switch (event->reason)
+    {
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        handle_no_ap_found_in_authmode_threshold();
+        break;
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_CONNECTION_FAIL:
+        handle_common_sta_disconnect_event();
+        break;
+    case WIFI_REASON_AUTH_EXPIRE:
+        ESP_LOGW(TAG_STA, "La autenticación ha expirado");
+        wifi_reconnect();
+        break;
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+        ESP_LOGW(TAG_STA, "Versión de RSN IE no soportada");
+        wifi_reconnect();
+        break;
+    case WIFI_REASON_BEACON_TIMEOUT:
+        ESP_LOGW(TAG_STA, "Tiempo de espera de beacon agotado");
+        wifi_reconnect();
+        break;
+    case WIFI_REASON_ASSOC_LEAVE:
+        ESP_LOGW(TAG_STA, "El cliente ha dejado la red");
+        wifi_reconnect();
+        break;
+    case WIFI_REASON_AUTH_FAIL:
+        ESP_LOGW(TAG_STA, "Fallo en la autenticación");
+        wifi_reconnect();
+        break;
+    default:
+        ESP_LOGW(TAG_STA, "Razón de desconexión no manejada: %d", event->reason);
+        wifi_reconnect();
+        break;
+    }
+}
+
+static void handle_no_ap_found_in_authmode_threshold(void)
+{
+    if (auth_mode_index < WIFI_AUTH_MAX)
+    {
+        wifi_config_t wifi_config;
+        ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
+
+        wifi_config.sta.threshold.authmode = (wifi_auth_mode_t)auth_mode_index++;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+        ESP_ERROR_CHECK(esp_wifi_disconnect());
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
+    else
+    {
+        ESP_LOGW(TAG_STA, "Todos los modos de autenticación han sido probados.");
+        auth_mode_index = 0; // Reiniciar el índice para futuros intentos
+    }
+}
+
+static void handle_common_sta_disconnect_event(void)
+{
+    wifi_config_t wifi_config;
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
+
+    get_wifi_credentials(&ssid, &password);
+    if (ssid && password)
+    {
+        strcpy((char *)wifi_config.sta.ssid, ssid);
+        strcpy((char *)wifi_config.sta.password, password);
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    }
+
+    wifi_reconnect();
+}
+
+static void handle_ip_event_sta_got_ip(void)
+{
+    esp_err_t err = esp_netif_set_default_netif(esp_netif_sta);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
+    }
+
+    err = esp_netif_napt_enable(esp_netif_ap);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
+    }
+
+    ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
 }
 
 static void wifi_reconnect(void)
@@ -394,7 +413,7 @@ void app_main(void)
             {
                 toggle_pin(&build_led);
             }
-            vTaskDelay(100 / portTICK_PERIOD_MS);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
         else
         {
@@ -463,7 +482,7 @@ static void wifi_start(void)
 
     // Registra el manejador de eventos de WiFi
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
 
     // Inicializa el controlador WiFi
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -824,5 +843,5 @@ static void save_wifi_credentials(char *ssid, char *password)
         ESP_LOGE(TAG_NVS, "Error al confirmar los cambios en el almacenamiento no volátil. Error %s", esp_err_to_name(err));
     }
 
-    nvs_close(nvs_handle_wifi); // Asegurar que el manejador de NVS se cierra
+    nvs_close(nvs_handle_wifi);
 }
