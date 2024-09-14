@@ -42,7 +42,7 @@
 // Definiciones WiFi AP
 #define WIFI_AP_SSID "ESP32-NAT"
 #define WIFI_AP_PASS "12345678"
-#define WIFI_AP_MAX_STA_CONN 2
+#define WIFI_AP_MAX_STA_CONN 3
 #define WIFI_AP_CHANNEL 0
 #define WIFI_AP_IP "192.168.2.1" // También se usa como gateway (Netmask: 255.255.255.0)
 
@@ -50,7 +50,7 @@
 #define WIFI_STA_SSID_DEFAULT "mySSID"
 #define WIFI_STA_PASS_DEFAULT "myPASS"
 #define WIFI_STA_MAX_RETRY 2
-#define WIFI_STA_RECONNECT_TIMEOUT 5
+#define WIFI_STA_RECONNECT_TIMEOUT 3
 
 // Tags para logging
 static const char *TAG_GPIO = "GPIO";
@@ -77,7 +77,7 @@ static esp_netif_t *esp_netif_ap = NULL;
 static esp_netif_t *esp_netif_sta = NULL;
 static char *ssid = NULL;
 static char *password = NULL;
-static int auth_mode_index = 3;
+static int auth_mode_index = 6;
 static bool esp_connected = false;
 static httpd_handle_t server_handle = NULL;
 
@@ -93,10 +93,9 @@ static void configure_http_server(void);                                        
 static void toggle_pin(digital_pin *pin);                                                                        // Cambia el estado de un pin GPIO
 
 // Declaración de funciones de eventos en el WiFi
-static void handle_sta_disconnected_event(wifi_event_sta_disconnected_t *event);    // Manejador de eventos de desconexión del cliente WiFi
-static void handle_no_ap_found_in_authmode_threshold(void);                         // Manejador de eventos de no encontrar AP en el umbral de autenticación
-static void handle_common_sta_disconnect_event(void);                               // Manejador de eventos comunes de desconexión del cliente WiFi
-static void handle_ip_event_sta_got_ip(void);                                       // Manejador de eventos de obtención de dirección IP del cliente WiFi
+static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event);   // Manejador de eventos de desconexión del cliente WiFi
+static void change_sta_authmode_threshold(void);                                    // Manejador de eventos de no encontrar AP en el umbral de autenticación
+static void update_wifi_credentials(void);                                          // Manejador de eventos comunes de desconexión del cliente WiFi
 static void wifi_reconnect(void);                                                   // Reintenta la conexión WiFi
 static void ap_set_dns_addr(esp_netif_t *esp_netif_ap, esp_netif_t *esp_netif_sta); // Establece la dirección DNS en el punto de acceso
 
@@ -185,7 +184,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
             esp_connected = false;
 
-            handle_sta_disconnected_event(event);
+            sta_disconnected_event_handler(event);
             break;
         }
         case WIFI_EVENT_STA_BEACON_TIMEOUT:
@@ -208,7 +207,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
             ESP_LOGI(TAG_STA, "Dirección IP asignada. IP: " IPSTR ", Máscara: " IPSTR ", Gateway: " IPSTR, IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask), IP2STR(&event->ip_info.gw));
 
-            handle_ip_event_sta_got_ip();
+            esp_err_t err = esp_netif_set_default_netif(esp_netif_sta);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
+            }
+
+            err = esp_netif_napt_enable(esp_netif_ap);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
+            }
+
+            ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
             break;
         }
         case IP_EVENT_STA_LOST_IP:
@@ -227,17 +238,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-static void handle_sta_disconnected_event(wifi_event_sta_disconnected_t *event)
+static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
 {
     switch (event->reason)
     {
     case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
-        handle_no_ap_found_in_authmode_threshold();
+        change_sta_authmode_threshold();
         break;
     case WIFI_REASON_NO_AP_FOUND:
     case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
     case WIFI_REASON_CONNECTION_FAIL:
-        handle_common_sta_disconnect_event();
+        update_wifi_credentials();
         break;
     case WIFI_REASON_AUTH_EXPIRE:
         ESP_LOGW(TAG_STA, "La autenticación ha expirado");
@@ -266,7 +277,7 @@ static void handle_sta_disconnected_event(wifi_event_sta_disconnected_t *event)
     }
 }
 
-static void handle_no_ap_found_in_authmode_threshold(void)
+static void change_sta_authmode_threshold(void)
 {
     if (auth_mode_index < WIFI_AUTH_MAX)
     {
@@ -286,7 +297,7 @@ static void handle_no_ap_found_in_authmode_threshold(void)
     }
 }
 
-static void handle_common_sta_disconnect_event(void)
+static void update_wifi_credentials(void)
 {
     wifi_config_t wifi_config;
     ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
@@ -300,23 +311,6 @@ static void handle_common_sta_disconnect_event(void)
     }
 
     wifi_reconnect();
-}
-
-static void handle_ip_event_sta_got_ip(void)
-{
-    esp_err_t err = esp_netif_set_default_netif(esp_netif_sta);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
-    }
-
-    err = esp_netif_napt_enable(esp_netif_ap);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
-    }
-
-    ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
 }
 
 static void wifi_reconnect(void)
@@ -566,7 +560,7 @@ esp_netif_t *wifi_sta_start(void)
                 .password = "",
                 .scan_method = WIFI_ALL_CHANNEL_SCAN,
                 .failure_retry_cnt = WIFI_STA_MAX_RETRY,
-                .threshold.authmode = WIFI_AUTH_WPA3_PSK,
+                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
                 .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
             },
     };
@@ -683,7 +677,7 @@ static void configure_http_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
 
-    ESP_LOGI(TAG_HTTP, "Servidor web iniciado en puerto: %d", config.server_port);
+    ESP_LOGI(TAG_HTTP, "Iniciando servidor web en puerto: %d", config.server_port);
 
     // Registra el manejador de eventos del servidor HTTP
     esp_event_handler_register(ESP_HTTP_SERVER_EVENT, ESP_EVENT_ANY_ID, &http_event_handler, server_handle);
