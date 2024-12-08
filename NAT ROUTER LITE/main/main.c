@@ -47,8 +47,8 @@
 #define WIFI_AP_IP "192.168.2.1" // También se usa como gateway (Netmask: 255.255.255.0)
 
 // Definiciones WiFi STA
-#define WIFI_STA_SSID_DEFAULT "mySSID"
-#define WIFI_STA_PASS_DEFAULT "myPASS"
+#define WIFI_STA_SSID_DEFAULT "SSID"
+#define WIFI_STA_PASS_DEFAULT "PASS"
 #define WIFI_STA_MAX_RETRY 2
 #define WIFI_STA_RECONNECT_TIMEOUT 3
 
