@@ -407,12 +407,12 @@ void app_main(void)
             {
                 toggle_pin(&build_led);
             }
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            vTaskDelay(500 / portTICK_PERIOD_MS);
         }
         else
         {
             toggle_pin(&build_led);
-            vTaskDelay(300 / portTICK_PERIOD_MS);
+            vTaskDelay(500 / portTICK_PERIOD_MS);
         }
     }
 }
