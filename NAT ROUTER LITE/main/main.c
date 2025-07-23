@@ -225,9 +225,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         case IP_EVENT_STA_LOST_IP:
             ESP_LOGW(TAG_STA, "Dirección IP perdida");
             break;
-        case IP_EVENT_AP_STAIPASSIGNED:
+        case IP_EVENT_ASSIGNED_IP_TO_CLIENT:
         {
-            ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+            ip_event_assigned_ip_to_client_t *event = (ip_event_assigned_ip_to_client_t *)event_data;
             ESP_LOGI(TAG_AP, "Dirección IP asignada al cliente. IP: " IPSTR ", MAC: " MACSTR, IP2STR(&event->ip), MAC2STR(event->mac));
             break;
         }
