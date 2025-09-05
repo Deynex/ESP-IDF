@@ -21,14 +21,8 @@
 #include "lwip/sys.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include <ctype.h>
-#include <inttypes.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/param.h>
-#include <unistd.h>
+#include <stdbool.h>
 #if IP_NAPT
 #include "lwip/lwip_napt.h"
 #endif
@@ -78,7 +72,7 @@ static esp_netif_t *esp_netif_sta = NULL;
 static char *ssid = NULL;
 static char *password = NULL;
 static int auth_mode_index = 6;
-static bool esp_connected = false;
+static bool esp_connected = 0;
 static httpd_handle_t server_handle = NULL;
 
 // Declaración de funciones principales
@@ -175,14 +169,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         {
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
             ESP_LOGI(TAG_STA, "Conectado a la red. MAC: " MACSTR ", AID: %d", MAC2STR(event->bssid), event->aid);
-            esp_connected = true;
+            esp_connected = 1;
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED:
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
-            esp_connected = false;
+            esp_connected = 0;
 
             sta_disconnected_event_handler(event);
             break;
@@ -399,7 +393,7 @@ void app_main(void)
     configure_http_server();
 
     // Bucle principal
-    while (true)
+    while (1)
     {
         if (esp_connected)
         {
@@ -527,10 +521,10 @@ esp_netif_t *wifi_ap_start(void)
 #else
                 .authmode = WIFI_AUTH_WPA2_PSK,
 #endif
-                .ftm_responder = false,
+                .ftm_responder = 0,
                 .pmf_cfg =
                     {
-                        .required = true,
+                        .required = 1,
                     },
             },
     };
