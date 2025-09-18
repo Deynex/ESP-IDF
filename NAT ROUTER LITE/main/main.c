@@ -72,7 +72,7 @@ static esp_netif_t *esp_netif_sta = NULL;
 static char *ssid = NULL;
 static char *password = NULL;
 static int auth_mode_index = 6;
-static bool esp_connected = 0;
+static bool esp_connected = false;
 static httpd_handle_t server_handle = NULL;
 
 // Declaración de funciones principales
