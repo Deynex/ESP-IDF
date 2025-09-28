@@ -393,7 +393,7 @@ void app_main(void)
     configure_http_server();
 
     // Bucle principal
-    while (1)
+    while (true)
     {
         if (esp_connected)
         {
