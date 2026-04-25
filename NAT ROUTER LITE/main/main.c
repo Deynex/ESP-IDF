@@ -23,9 +23,6 @@
 #include "nvs_flash.h"
 #include <sys/param.h>
 #include <stdbool.h>
-#include <ctype.h>
-#include <stdlib.h>
-#include <string.h>
 #if IP_NAPT
 #include "lwip/lwip_napt.h"
 #endif
@@ -48,7 +45,6 @@
 #define WIFI_STA_PASS_DEFAULT "PASS"
 #define WIFI_STA_MAX_RETRY 2
 #define WIFI_STA_RECONNECT_TIMEOUT 3
-#define MAX_POST_BODY_LEN 255
 
 // Tags para logging
 static const char *TAG_GPIO = "GPIO";
@@ -103,8 +99,8 @@ static esp_err_t favicon_handler(httpd_req_t *req); // Manejador del favicon
 static esp_err_t post_handler(httpd_req_t *req);    // Manejador de la petición POST
 
 // Declaración de funciones del web server
-static void url_decode(char *dst, size_t dst_len, const char *src);             // Decodifica una URL
-static void save_wifi_credentials(const char *ssid, const char *password); // Obtiene las credenciales de WiFi del almacenamiento no volátil
+static void url_decode(char *dst, const char *src);            // Decodifica una URL
+static void save_wifi_credentials(char *ssid, char *password); // Obtiene las credenciales de WiFi del almacenamiento no volátil
 
 // Paginas web
 extern const uint8_t main_html_start[] asm("_binary_main_html_start");
@@ -162,7 +158,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(TAG_AP, "Punto de acceso WiFi detenido");
             break;
         case WIFI_EVENT_STA_START:
-        {
             ESP_LOGI(TAG_STA, "Cliente WiFi iniciado, conectando a la red...");
             esp_err_t err = esp_wifi_connect();
             if (err != ESP_OK)
@@ -170,19 +165,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGE(TAG_STA, "Error al conectar al WiFi. Error %s", esp_err_to_name(err));
             }
             break;
-        }
         case WIFI_EVENT_STA_CONNECTED:
         {
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
             ESP_LOGI(TAG_STA, "Conectado a la red. MAC: " MACSTR ", AID: %d", MAC2STR(event->bssid), event->aid);
-            esp_connected = true;
+            esp_connected = 1;
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED:
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
-            esp_connected = false;
+            esp_connected = 0;
 
             sta_disconnected_event_handler(event);
             break;
@@ -320,8 +314,8 @@ static void update_wifi_credentials(void)
     get_wifi_credentials(&ssid, &password);
     if (ssid && password)
     {
-        strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-        strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+        strcpy((char *)wifi_config.sta.ssid, ssid);
+        strcpy((char *)wifi_config.sta.password, password);
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     }
 
@@ -332,20 +326,10 @@ static void wifi_reconnect(void)
 {
     ESP_LOGI(TAG_WIFI, "Reconectando al WiFi...");
 
-    if (reconnect_timer == NULL)
-    {
-        ESP_LOGE(TAG_TIMER, "Timer de reconexión no inicializado");
-        return;
-    }
-
     // Detener el timer si ya está corriendo
-    esp_err_t err = esp_timer_stop(reconnect_timer);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
-    {
-        ESP_LOGW(TAG_TIMER, "No se pudo detener el timer. Error %s", esp_err_to_name(err));
-    }
+    esp_timer_stop(reconnect_timer);
 
-    err = esp_timer_start_once(reconnect_timer, WIFI_STA_RECONNECT_TIMEOUT * 1000000);
+    esp_err_t err = esp_timer_start_once(reconnect_timer, WIFI_STA_RECONNECT_TIMEOUT * 1000000);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_TIMER, "Error al iniciar el timer. Error %s", esp_err_to_name(err));
@@ -615,12 +599,29 @@ esp_netif_t *wifi_sta_start(void)
 
 static void get_wifi_credentials(char **ssid, char **password)
 {
-    nvs_handle_t nvs_handle_wifi = 0;
+    nvs_handle_t nvs_handle_wifi;
     esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil. Error %s", esp_err_to_name(err));
-        return;
+        if (err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            ESP_LOGW(TAG_NVS, "Creando espacio de almacenamiento no volátil...");
+            err = nvs_flash_init_partition(WIFI_NAMESPACE);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG_NVS, "Error al inicializar el espacio de almacenamiento no volátil. Error %s", esp_err_to_name(err));
+            }
+            else
+            {
+                ESP_LOGI(TAG_NVS, "Espacio de almacenamiento no volátil creado correctamente");
+                err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
+                if (err != ESP_OK)
+                {
+                    ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil después de la creación. Error %s", esp_err_to_name(err));
+                }
+            }
+        }
     }
 
     size_t ssid_len = 0;
@@ -652,39 +653,17 @@ static void get_wifi_credentials(char **ssid, char **password)
 
         *ssid = malloc(ssid_len);
         *password = malloc(password_len);
-        if (*ssid == NULL || *password == NULL)
-        {
-            ESP_LOGE(TAG_NVS, "Memoria insuficiente para cargar credenciales WiFi");
-            free(*ssid);
-            free(*password);
-            *ssid = NULL;
-            *password = NULL;
-            nvs_close(nvs_handle_wifi);
-            return;
-        }
 
         err = nvs_get_str(nvs_handle_wifi, "ssid", *ssid, &ssid_len);
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG_NVS, "Error al obtener el SSID del almacenamiento no volátil. Error %s", esp_err_to_name(err));
-            free(*ssid);
-            free(*password);
-            *ssid = NULL;
-            *password = NULL;
-            nvs_close(nvs_handle_wifi);
-            return;
         }
 
         err = nvs_get_str(nvs_handle_wifi, "password", *password, &password_len);
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG_NVS, "Error al obtener la contraseña del almacenamiento no volátil. Error %s", esp_err_to_name(err));
-            free(*ssid);
-            free(*password);
-            *ssid = NULL;
-            *password = NULL;
-            nvs_close(nvs_handle_wifi);
-            return;
         }
     }
     else
@@ -780,19 +759,11 @@ static esp_err_t favicon_handler(httpd_req_t *req)
 static esp_err_t post_handler(httpd_req_t *req)
 {
     char buf[256];
-    int ret;
-    int remaining = req->content_len;
-    int offset = 0;
-
-    if (req->content_len <= 0 || req->content_len > MAX_POST_BODY_LEN)
-    {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request body size");
-        return ESP_FAIL;
-    }
+    int ret, remaining = req->content_len;
 
     while (remaining > 0)
     {
-        if ((ret = httpd_req_recv(req, buf + offset, MIN(remaining, (int)sizeof(buf) - 1 - offset))) <= 0)
+        if ((ret = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf) - 1))) <= 0)
         {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT)
             {
@@ -801,32 +772,21 @@ static esp_err_t post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         remaining -= ret;
-        offset += ret;
+        buf[ret] = '\0'; // Asegurarse de que el buffer esté terminado con un carácter nulo
     }
-    buf[offset] = '\0';
 
     char decoded_buf[256];
-    url_decode(decoded_buf, sizeof(decoded_buf), buf);
+    url_decode(decoded_buf, buf);
 
-    ESP_LOGI(TAG_HTTP, "Datos recibidos: %s", decoded_buf);
+    printf("Datos recibidos: %s\n", decoded_buf);
 
     // Parsear los datos recibidos para extraer ssid y password
     char ssid[32] = {0};
     char password[64] = {0};
 
     // ESP-IDF buscará las claves directamente en el string decodificado
-    if (httpd_query_key_value(decoded_buf, "ssid", ssid, sizeof(ssid)) != ESP_OK ||
-        httpd_query_key_value(decoded_buf, "password", password, sizeof(password)) != ESP_OK)
-    {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ssid/password");
-        return ESP_FAIL;
-    }
-
-    if (ssid[0] == '\0' || password[0] == '\0' || strlen(password) < 8)
-    {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid credentials");
-        return ESP_FAIL;
-    }
+    httpd_query_key_value(decoded_buf, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(decoded_buf, "password", password, sizeof(password));
 
     // Guardar las credenciales de WiFi en la memoria no volátil
     save_wifi_credentials(ssid, password);
@@ -841,16 +801,10 @@ static esp_err_t post_handler(httpd_req_t *req)
 }
 
 // Función para decodificar URL
-static void url_decode(char *dst, size_t dst_len, const char *src)
+static void url_decode(char *dst, const char *src)
 {
-    if (dst_len == 0)
-    {
-        return;
-    }
-
     char a, b;
-    size_t i = 0;
-    while (*src && i < (dst_len - 1))
+    while (*src)
     {
         if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b)))
         {
@@ -866,30 +820,29 @@ static void url_decode(char *dst, size_t dst_len, const char *src)
                 b -= ('A' - 10);
             else
                 b -= '0';
-            dst[i++] = 16 * a + b;
+            *dst++ = 16 * a + b;
             src += 3;
         }
         else if (*src == '+')
         {
-            dst[i++] = ' ';
+            *dst++ = ' ';
             src++;
         }
         else
         {
-            dst[i++] = *src++;
+            *dst++ = *src++;
         }
     }
-    dst[i] = '\0';
+    *dst = '\0';
 }
 
-static void save_wifi_credentials(const char *ssid, const char *password)
+static void save_wifi_credentials(char *ssid, char *password)
 {
     nvs_handle_t nvs_handle_wifi;
     esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil. Error %s", esp_err_to_name(err));
-        return;
     }
 
     err = nvs_set_str(nvs_handle_wifi, "ssid", ssid);
