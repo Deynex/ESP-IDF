@@ -207,11 +207,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
             }
 
+#if IP_NAPT
             err = esp_netif_napt_enable(esp_netif_ap);
             if (err != ESP_OK)
             {
                 ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
             }
+#else
+            ESP_LOGW(TAG_WIFI, "El soporte NAPT no está habilitado en la configuración de lwIP");
+#endif
 
             ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
             break;
@@ -225,6 +229,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(TAG_AP, "Dirección IP asignada al cliente. IP: " IPSTR ", MAC: " MACSTR, IP2STR(&event->ip), MAC2STR(event->mac));
             break;
         }
+        case IP_EVENT_GOT_IP6:
+            ESP_LOGI(TAG_STA, "Dirección IPv6 asignada (ignorada para NAT IPv4)");
+            break;
+        case IP_EVENT_NETIF_UP:
+            ESP_LOGI(TAG_WIFI, "Interfaz de red levantada (Netif Up)");
+            break;
+        case IP_EVENT_NETIF_DOWN:
+            ESP_LOGI(TAG_WIFI, "Interfaz de red bajada (Netif Down)");
+            break;
         default:
             ESP_LOGW(TAG_WIFI, "Evento no manejado en IP: %ld", event_id);
             break;
@@ -242,6 +255,8 @@ static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
     case WIFI_REASON_NO_AP_FOUND:
     case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
     case WIFI_REASON_CONNECTION_FAIL:
+    case WIFI_REASON_STA_LEAVING:
+        ESP_LOGI(TAG_STA, "Desconexión local o red no encontrada, actualizando credenciales y reconectando...");
         update_wifi_credentials();
         break;
     case WIFI_REASON_AUTH_EXPIRE:
@@ -309,9 +324,10 @@ static void update_wifi_credentials(void)
 
 static void wifi_reconnect(void)
 {
-    ESP_ERROR_CHECK(esp_wifi_disconnect());
-
     ESP_LOGI(TAG_WIFI, "Reconectando al WiFi...");
+
+    // Detener el timer si ya está corriendo
+    esp_timer_stop(reconnect_timer);
 
     esp_err_t err = esp_timer_start_once(reconnect_timer, WIFI_STA_RECONNECT_TIMEOUT * 1000000);
     if (err != ESP_OK)
@@ -624,6 +640,17 @@ static void get_wifi_credentials(char **ssid, char **password)
 
     if (ssid_len > 0 && password_len > 0)
     {
+        if (*ssid)
+        {
+            free(*ssid);
+            *ssid = NULL;
+        }
+        if (*password)
+        {
+            free(*password);
+            *password = NULL;
+        }
+
         *ssid = malloc(ssid_len);
         *password = malloc(password_len);
 
@@ -731,7 +758,7 @@ static esp_err_t favicon_handler(httpd_req_t *req)
 
 static esp_err_t post_handler(httpd_req_t *req)
 {
-    char buf[100];
+    char buf[256];
     int ret, remaining = req->content_len;
 
     while (remaining > 0)
@@ -748,7 +775,7 @@ static esp_err_t post_handler(httpd_req_t *req)
         buf[ret] = '\0'; // Asegurarse de que el buffer esté terminado con un carácter nulo
     }
 
-    char decoded_buf[100];
+    char decoded_buf[256];
     url_decode(decoded_buf, buf);
 
     printf("Datos recibidos: %s\n", decoded_buf);
@@ -756,7 +783,10 @@ static esp_err_t post_handler(httpd_req_t *req)
     // Parsear los datos recibidos para extraer ssid y password
     char ssid[32] = {0};
     char password[64] = {0};
-    sscanf(decoded_buf, "ssid=%31[^&]&password=%63s", ssid, password);
+
+    // ESP-IDF buscará las claves directamente en el string decodificado
+    httpd_query_key_value(decoded_buf, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(decoded_buf, "password", password, sizeof(password));
 
     // Guardar las credenciales de WiFi en la memoria no volátil
     save_wifi_credentials(ssid, password);
@@ -765,6 +795,8 @@ static esp_err_t post_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, (const char *)main_html_start, main_html_end - main_html_start);
+    ESP_LOGI(TAG_HTTP, "Nuevas credenciales guardadas. Reiniciando conexión STA...");
+    esp_wifi_disconnect();
     return ESP_OK;
 }
 
