@@ -253,8 +253,16 @@ static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
         change_sta_authmode_threshold();
         break;
     case WIFI_REASON_NO_AP_FOUND:
+        ESP_LOGW(TAG_STA, "Punto de acceso no encontrado");
+        break;
     case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        ESP_LOGW(TAG_STA, "Tiempo de espera del handshake de 4 vías agotado");
+        wifi_reconnect();
+        break;
     case WIFI_REASON_CONNECTION_FAIL:
+        ESP_LOGW(TAG_STA, "Fallo en la conexión");
+        wifi_reconnect();
+        break;
     case WIFI_REASON_STA_LEAVING:
         ESP_LOGI(TAG_STA, "Desconexión local o red no encontrada, actualizando credenciales y reconectando...");
         update_wifi_credentials();
