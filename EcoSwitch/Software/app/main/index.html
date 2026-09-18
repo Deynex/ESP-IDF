@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Control</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #0f0f0f;
+            color: #ffffff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            text-align: center;
+            max-width: 350px;
+            width: 50%;
+            min-width: 270px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #1f1f1f;
+            border-radius: 20px;
+            box-shadow: 10px 10px 15px rgba(0, 0, 0, 0.5);
+        }
+
+        h1 {
+            margin: 0;
+            margin-bottom: 15px;
+        }
+
+        button {
+            background-color: gray;
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            box-sizing: border-box;
+            box-shadow: 10px 10px 15px rgba(0, 0, 0, .3);
+            margin-bottom: 15px;
+        }
+
+        .current-display {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+
+        .current-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00ff88;
+        }
+
+        .power-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #ffaa00;
+        }
+
+        .display-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .display-item {
+            flex: 1;
+            text-align: center;
+        }
+
+        .display-item:last-child {
+            margin-bottom: 0;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Switch</h1>
+        <button id="switchButton" disabled>Conectando...</button>
+
+        <div class="current-display">
+            <div class="display-row">
+                <div class="display-item">
+                    <div>Corriente:</div>
+                    <div class="current-value" id="currentValue">-- A</div>
+                </div>
+                <div class="display-item">
+                    <div>Potencia:</div>
+                    <div class="power-value" id="powerValue">-- W</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        // JavaScript para controlar el Switch
+        var switchState = false;
+        var switchButton = document.getElementById('switchButton');
+        var currentValueElement = document.getElementById('currentValue');
+        var powerValueElement = document.getElementById('powerValue');
+        var ws;
+        var reconnectInterval;
+
+        function connectWebSocket() {
+            ws = new WebSocket('ws://' + location.hostname + '/ws');
+            ws.binaryType = 'arraybuffer';
+
+            ws.addEventListener('open', function (event) {
+                console.log('WebSocket conectado');
+                switchButton.disabled = false;
+                switchButton.innerHTML = 'Cargando...';
+
+                // Limpiar cualquier intento de reconexión
+                if (reconnectInterval) {
+                    clearInterval(reconnectInterval);
+                    reconnectInterval = null;
+                }
+            });
+
+            ws.addEventListener('message', function (event) {
+                var data = new Uint8Array(event.data);
+                console.log('Mensaje recibido:', data);
+
+                if (data.length >= 5) {
+                    var messageType = data[0];
+
+                    // Bytes 1-4: valor de corriente (float)
+                    var currentBytes = data.slice(1, 5);
+                    var currentView = new DataView(currentBytes.buffer);
+                    var current = currentView.getFloat32(0, true); // true para little-endian
+
+                    if (messageType === 0xFF) {
+                        // Mensaje solo de corriente
+                        updateCurrentDisplay(current);
+                        console.log('Corriente actualizada:', current);
+                    } else {
+                        // Mensaje de estado + corriente
+                        switchState = messageType === 1;
+                        updateButtonUI();
+                        updateCurrentDisplay(current);
+                        console.log('Estado:', switchState, 'Corriente:', current);
+                    }
+                } else {
+                    console.warn('Datos insuficientes recibidos');
+                }
+            });
+
+            ws.addEventListener('error', function (event) {
+                console.error('Error en WebSocket:', event);
+                switchButton.disabled = true;
+                switchButton.innerHTML = 'Error';
+                currentValueElement.textContent = '-- A';
+                powerValueElement.textContent = '-- W';
+            });
+
+            ws.addEventListener('close', function (event) {
+                console.log('WebSocket cerrado:', event.code, event.reason);
+                switchButton.disabled = true;
+                switchButton.innerHTML = 'Desconectado';
+                currentValueElement.textContent = '-- A';
+                powerValueElement.textContent = '-- W';
+
+                // Intentar reconectar después de 3 segundos
+                if (!reconnectInterval) {
+                    reconnectInterval = setTimeout(function () {
+                        console.log('Intentando reconectar...');
+                        connectWebSocket();
+                    }, 3000);
+                }
+            });
+        }
+
+        function updateCurrentDisplay(current) {
+            currentValueElement.textContent = current.toFixed(3) + ' A';
+
+            // Calcular potencia (P = V * I, donde V = 110V)
+            var power = current * 110;
+            powerValueElement.textContent = power.toFixed(1) + ' W';
+        }
+
+        function updateButtonUI() {
+            switchButton.innerHTML = switchState ? 'ON' : 'OFF';
+            switchButton.style.backgroundColor = switchState ? '#2ed111' : '#ff1414';
+        }
+
+        function sendState() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                let bytes = new Uint8Array([switchState ? 1 : 0]);
+                ws.send(bytes);
+                console.log('Estado enviado:', switchState);
+            } else {
+                console.error('WebSocket no está conectado');
+            }
+        }
+
+        // Manejar el clic del botón
+        switchButton.addEventListener('click', function () {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                switchState = !switchState;
+                updateButtonUI();
+                sendState();
+            }
+        });
+
+        // Inicializar conexión
+        connectWebSocket();
+    </script>
+</body>
+
+</html>
