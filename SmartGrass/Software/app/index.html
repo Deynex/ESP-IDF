@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>ESP32 Lawn Mower</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+            padding: 10px;
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: auto auto;
+            gap: 15px;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding-bottom: 20px;
+        }
+
+        .panel {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }
+
+        .panel-top-left {
+            grid-column: 1;
+            grid-row: 1;
+        }
+
+        .panel-bottom-left {
+            grid-column: 1;
+            grid-row: 2;
+        }
+
+        .panel-right {
+            grid-column: 2;
+            grid-row: 1 / 3;
+        }
+
+        @media (max-width: 1024px) {
+            body {
+                padding: 5px;
+            }
+
+            .container {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto;
+                gap: 15px;
+            }
+
+            .panel-top-left {
+                grid-column: 1;
+                grid-row: 1;
+            }
+
+            .panel-right {
+                grid-column: 1;
+                grid-row: 2;
+                min-height: 350px;
+            }
+
+            .panel-bottom-left {
+                grid-column: 1;
+                grid-row: 3;
+            }
+
+            .control-pad {
+                min-height: 200px;
+            }
+        }
+
+        .panel-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #58a6ff;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* --- Telemetría --- */
+        .telemetry-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .telemetry-group {
+            background: #21262d;
+            border-radius: 6px;
+            padding: 8px;
+            border: 1px solid #30363d;
+        }
+
+        .telemetry-group h4 {
+            font-size: 12px;
+            color: #8b949e;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .telemetry-rows {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px 15px;
+        }
+
+        .telemetry-item {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+        }
+
+        .telemetry-item .label {
+            color: #8b949e;
+        }
+
+        .telemetry-item .value {
+            font-weight: 600;
+            color: #f0f6fc;
+            font-family: 'Consolas', monospace;
+        }
+
+        /* --- Control de Movimiento --- */
+        .control-pad {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            grid-template-rows: repeat(3, 1fr);
+            gap: 10px;
+            flex-grow: 1;
+            min-height: 180px;
+        }
+
+        .control-button {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            font-size: 28px;
+            cursor: pointer;
+            transition: all 0.2s;
+            touch-action: manipulation;
+        }
+
+        .control-button:active {
+            background-color: #58a6ff;
+            color: #0d1117;
+            transform: scale(0.95);
+        }
+
+        /* Estilo Deshabilitado para botones de movimiento */
+        .control-button.disabled-btn {
+            opacity: 0.3;
+            pointer-events: none;
+            /* Evita clicks */
+            border-color: #30363d;
+            background-color: #161b22;
+        }
+
+        #btn-forward {
+            grid-column: 2;
+            grid-row: 1;
+        }
+
+        #btn-left {
+            grid-column: 1;
+            grid-row: 2;
+        }
+
+        #btn-right {
+            grid-column: 3;
+            grid-row: 2;
+        }
+
+        #btn-backward {
+            grid-column: 2;
+            grid-row: 3;
+        }
+
+        /* Botón Power Central */
+        #btn-power {
+            grid-column: 2;
+            grid-row: 2;
+            background-color: #21262d;
+            border: 2px solid #8b949e;
+            color: #8b949e;
+            font-size: 20px;
+            font-weight: bold;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            cursor: pointer;
+            /* Siempre clickable */
+            pointer-events: auto !important;
+            /* Sobrescribe disabled-btn si se aplicara por error */
+            opacity: 1 !important;
+        }
+
+        #btn-power span {
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+
+        #btn-power.enabled {
+            background-color: #238636;
+            border-color: #2ea043;
+            color: white;
+            box-shadow: 0 0 10px rgba(46, 160, 67, 0.4);
+        }
+
+        #btn-power.disabled {
+            background-color: #8b0000;
+            border-color: #a11313;
+            color: white;
+        }
+
+        /* --- Cuchilla --- */
+        .blade-control {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            align-items: center;
+            margin-top: 20px;
+            padding: 20px;
+            background: #0d1117;
+            border-radius: 10px;
+            border: 1px solid #30363d;
+        }
+
+        .blade-button {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            border: 4px solid #30363d;
+            background: #21262d;
+            color: #8b949e;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            transition: all 0.3s;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .blade-button.active {
+            border-color: #238636;
+            background: #2ea043;
+            color: white;
+            box-shadow: 0 0 20px rgba(46, 160, 67, 0.4);
+            animation: pulse 2s infinite;
+        }
+
+        /* Cuchilla deshabilitada */
+        .blade-button.disabled-btn {
+            opacity: 0.4;
+            pointer-events: none;
+            border-color: #30363d;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.05);
+            }
+
+            100% {
+                transform: scale(1);
+            }
+        }
+
+        .warning-text {
+            color: #e3b341;
+            font-size: 12px;
+            margin-top: 5px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        /* Estado */
+        .status-bar {
+            margin-top: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding-top: 15px;
+            border-top: 1px solid #30363d;
+        }
+
+        .status-light {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #8b0000;
+        }
+
+        .status-light.connected {
+            background-color: #238636;
+        }
+
+        .blade-info {
+            width: 100%;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Telemetría Detallada -->
+        <div class="panel panel-top-left">
+            <div class="panel-title">Telemetría</div>
+            <div class="telemetry-section">
+                <!-- Grupo IMU -->
+                <div class="telemetry-group">
+                    <h4>IMU (MPU6050)</h4>
+                    <div class="telemetry-rows">
+                        <div class="telemetry-item"><span class="label">Accel X:</span> <span class="value"
+                                id="accel_x">0</span></div>
+                        <div class="telemetry-item"><span class="label">Gyro X:</span> <span class="value"
+                                id="gyro_x">0</span></div>
+                        <div class="telemetry-item"><span class="label">Accel Y:</span> <span class="value"
+                                id="accel_y">0</span></div>
+                        <div class="telemetry-item"><span class="label">Gyro Y:</span> <span class="value"
+                                id="gyro_y">0</span></div>
+                        <div class="telemetry-item"><span class="label">Accel Z:</span> <span class="value"
+                                id="accel_z">0</span></div>
+                        <div class="telemetry-item"><span class="label">Gyro Z:</span> <span class="value"
+                                id="gyro_z">0</span></div>
+                        <div class="telemetry-item"><span class="label">Pitch:</span> <span class="value"
+                                id="pitch">0</span>°</div>
+                        <div class="telemetry-item"><span class="label">Roll:</span> <span class="value"
+                                id="roll">0</span>°</div>
+                    </div>
+                </div>
+                <!-- Grupo Motor/Encoder -->
+                <div class="telemetry-group">
+                    <h4>Tracción (MKS Servo)</h4>
+                    <div class="telemetry-rows">
+                        <div class="telemetry-item"><span class="label">Angle:</span> <span class="value"
+                                id="enc_angle">0.0</span>°</div>
+                        <div class="telemetry-item"><span class="label">Error:</span> <span class="value"
+                                id="shaft_error">0.0</span>°</div>
+                        <div class="telemetry-item"><span class="label">Total:</span> <span class="value"
+                                id="enc_total">0.0</span>°</div>
+                        <div class="telemetry-item"><span class="label">Vueltas:</span> <span class="value"
+                                id="enc_carry">0</span></div>
+                        <div class="telemetry-item"><span class="label">Speed:</span> <span class="value"
+                                id="motor_speed">0</span> RPM</div>
+                        <div class="telemetry-item"><span class="label">Current:</span> <span class="value"
+                                id="motor_current">0</span> mA</div>
+                    </div>
+                </div>
+                <!-- Grupo Sistema -->
+                <div class="telemetry-group">
+                    <h4>Sistema</h4>
+                    <div class="telemetry-rows">
+                        <div class="telemetry-item"><span class="label">Temp:</span> <span class="value"
+                                id="temp">0.0</span> °C</div>
+                        <div class="telemetry-item"><span class="label">Estado:</span> <span class="value"
+                                id="sys-status" style="color:#238636">ON</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Control Movimiento -->
+        <div class="panel panel-bottom-left">
+            <div class="panel-title">Control de Tracción</div>
+            <div class="control-pad">
+                <!-- Botones de Movimiento (Inicialmente activos por defecto) -->
+                <div class="control-button" id="btn-forward">▲</div>
+                <div class="control-button" id="btn-left">◀</div>
+
+                <!-- Botón Power Central -->
+                <div class="control-button enabled" id="btn-power">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+                        <line x1="12" y1="2" x2="12" y2="12"></line>
+                    </svg>
+                    <span>ON</span>
+                </div>
+
+                <div class="control-button" id="btn-right">▶</div>
+                <div class="control-button" id="btn-backward">▼</div>
+            </div>
+        </div>
+
+        <!-- Control Cuchilla -->
+        <div class="panel panel-right">
+            <div class="panel-title">Sistema de Corte</div>
+            <div class="blade-control">
+                <button id="btn-blade" class="blade-button">
+                    <span style="font-size: 30px;">☢</span>
+                    <span style="margin: 5px 0;">CUCHILLA</span>
+                    <span id="blade-status-text" style="font-size: 14px; font-weight: normal; opacity: 0.8;">OFF</span>
+                </button>
+                <div class="warning-text">¡PELIGRO! ALTA VELOCIDAD</div>
+            </div>
+            <div class="blade-info telemetry-group">
+                <h4>Estado Cuchilla</h4>
+                <div class="telemetry-item"><span class="label">Potencia:</span> <span class="value"
+                        id="blade-pwr">0%</span></div>
+                <div class="telemetry-item"><span class="label">Modo:</span> <span class="value">Manual</span></div>
+            </div>
+            <div class="status-bar">
+                <div class="status-light" id="status-light"></div>
+                <span id="status-text">Desconectado</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Comandos Binarios
+        const CMD_STOP = 0x00;
+        const CMD_FORWARD = 0x01;
+        const CMD_BACKWARD = 0x02;
+        const CMD_LEFT = 0x03;
+        const CMD_RIGHT = 0x04;
+        const CMD_BLADE_ON = 0x05;
+        const CMD_BLADE_OFF = 0x06;
+        const CMD_ENABLE = 0x07;
+        const CMD_DISABLE = 0x08;
+
+        let socket;
+        let bladeActive = false;
+        let motorsEnabled = true; // Asumimos habilitado al inicio (igual que main.c)
+
+        // UI Elements
+        const statusLight = document.getElementById('status-light');
+        const statusText = document.getElementById('status-text');
+        const btnBlade = document.getElementById('btn-blade');
+        const bladeText = document.getElementById('blade-status-text');
+        const bladePwr = document.getElementById('blade-pwr');
+        const btnPower = document.getElementById('btn-power');
+        const sysStatus = document.getElementById('sys-status');
+
+        // Botones de movimiento para habilitar/deshabilitar
+        const moveButtons = [
+            document.getElementById('btn-forward'),
+            document.getElementById('btn-backward'),
+            document.getElementById('btn-left'),
+            document.getElementById('btn-right')
+        ];
+
+        // Mapeo UI
+        const uiMap = {
+            'accel_x': 'accel_x', 'accel_y': 'accel_y', 'accel_z': 'accel_z',
+            'gyro_x': 'gyro_x', 'gyro_y': 'gyro_y', 'gyro_z': 'gyro_z',
+            'temp': 'temp',
+            'enc_angle': 'enc_angle', 'enc_total': 'enc_total', 'enc_carry': 'enc_carry', 'shaft_error': 'shaft_error',
+            'motor_speed': 'motor_speed', 'motor_current': 'motor_current'
+        };
+
+        function connectWebSocket() {
+            const ws_url = "ws://" + window.location.host + "/ws";
+            socket = new WebSocket(ws_url);
+            socket.binaryType = "arraybuffer";
+
+            socket.onopen = () => {
+                statusLight.classList.add('connected');
+                statusText.innerText = "Conectado";
+            };
+
+            socket.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    try {
+                        const data = JSON.parse(event.data);
+                        updateTelemetry(data);
+                    } catch (e) { console.error(e); }
+                }
+            };
+
+            socket.onclose = () => {
+                statusLight.classList.remove('connected');
+                statusText.innerText = "Reconectando...";
+                // Si desconectamos, apagamos UI por seguridad
+                if (bladeActive) toggleBladeUI(false);
+                if (motorsEnabled) togglePowerUI(false); // Reflejar desconexión
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        function updateTelemetry(data) {
+            for (const [id, key] of Object.entries(uiMap)) {
+                const el = document.getElementById(id);
+                if (el && data[key] !== undefined) {
+                    if (typeof data[key] === 'number' && !Number.isInteger(data[key])) {
+                        el.innerText = data[key].toFixed(1);
+                    } else {
+                        el.innerText = data[key];
+                    }
+                }
+            }
+            if (data.accel_z !== undefined) {
+                let ax = data.accel_x, ay = data.accel_y, az = data.accel_z;
+                let pitch = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * 57.29;
+                let roll = Math.atan2(-ax, Math.sqrt(ay * ay + az * az)) * 57.29;
+                document.getElementById('pitch').innerText = pitch.toFixed(0);
+                document.getElementById('roll').innerText = roll.toFixed(0);
+            }
+        }
+
+        function sendCommand(byte) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(new Uint8Array([byte]));
+            }
+        }
+
+        // --- Control Movimiento ---
+        const buttons = {
+            'btn-forward': CMD_FORWARD, 'btn-backward': CMD_BACKWARD,
+            'btn-left': CMD_LEFT, 'btn-right': CMD_RIGHT
+        };
+
+        for (const [id, cmd] of Object.entries(buttons)) {
+            const btn = document.getElementById(id);
+            // Al presionar, si está habilitado, mover
+            btn.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                if (motorsEnabled) sendCommand(cmd);
+            });
+            btn.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                if (motorsEnabled) sendCommand(cmd);
+            });
+            // Al soltar, STOP (frenado)
+            btn.addEventListener('mouseup', (e) => { e.preventDefault(); sendCommand(CMD_STOP); });
+            btn.addEventListener('touchend', (e) => { e.preventDefault(); sendCommand(CMD_STOP); });
+        }
+
+        // --- Función para actualizar UI de Power ---
+        function togglePowerUI(enabled) {
+            motorsEnabled = enabled;
+            if (motorsEnabled) {
+                btnPower.classList.remove('disabled');
+                btnPower.classList.add('enabled');
+                btnPower.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg><span>ON</span>';
+                sysStatus.innerText = "ON";
+                sysStatus.style.color = "#238636";
+
+                // Habilitar botones movimiento y cuchilla
+                moveButtons.forEach(btn => btn.classList.remove('disabled-btn'));
+                btnBlade.classList.remove('disabled-btn');
+            } else {
+                btnPower.classList.remove('enabled');
+                btnPower.classList.add('disabled');
+                btnPower.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg><span>OFF</span>';
+                sysStatus.innerText = "OFF";
+                sysStatus.style.color = "#a11313";
+
+                // Deshabilitar botones movimiento y cuchilla
+                moveButtons.forEach(btn => btn.classList.add('disabled-btn'));
+                btnBlade.classList.add('disabled-btn');
+
+                // Si deshabilitamos, también apagar cuchilla en UI
+                if (bladeActive) toggleBladeUI(false);
+            }
+        }
+
+        // --- Control Power (Enable/Disable) ---
+        btnPower.addEventListener('click', (e) => {
+            e.preventDefault();
+            const newState = !motorsEnabled;
+            togglePowerUI(newState);
+            sendCommand(newState ? CMD_ENABLE : CMD_DISABLE);
+        });
+
+        // --- Control Cuchilla ---
+        function toggleBladeUI(active) {
+            bladeActive = active;
+            if (bladeActive) {
+                btnBlade.classList.add('active');
+                bladeText.innerText = "ARMADO (ON)";
+                bladePwr.innerText = "30%";
+                bladePwr.style.color = "#2ea043";
+            } else {
+                btnBlade.classList.remove('active');
+                bladeText.innerText = "OFF";
+                bladePwr.innerText = "0%";
+                bladePwr.style.color = "#f0f6fc";
+            }
+        }
+
+        btnBlade.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Doble check por seguridad (aunque CSS pointer-events ya protege)
+            if (!motorsEnabled) return;
+
+            const newState = !bladeActive;
+            toggleBladeUI(newState);
+            sendCommand(newState ? CMD_BLADE_ON : CMD_BLADE_OFF);
+        });
+
+        // Estado inicial correcto
+        togglePowerUI(true);
+
+        connectWebSocket();
+    </script>
+</body>
+
+</html>
