@@ -31,3 +31,5 @@ Ejecuta el JavaScript real de `app/saved.html` con un navegador simulado. Compru
 ## Compilación y hardware
 
 Desde una terminal de ESP-IDF, ejecuta `idf.py build`. Para cambiar de chip usa una configuración independiente del target correspondiente. Las pruebas de host no emulan la radio Wi-Fi ni el enrutamiento NAPT de una placa física.
+
+Los perfiles por chip y los comandos para mantener compilaciones separadas están en [CONFIGURACION.md](../CONFIGURACION.md).

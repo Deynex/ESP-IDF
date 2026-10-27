@@ -1,3 +1,6 @@
+# Opciones comunes del router para ESP32 y ESP32-S3.
+# ESP-IDF carga despues sdkconfig.defaults.<IDF_TARGET> automaticamente.
+# Los perfiles por target describen las placas usadas en este proyecto.
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_IPV4_NAPT_PORTMAP=y

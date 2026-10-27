@@ -1,0 +1,10 @@
+# Perfil ESP32: conserva la configuracion actual del proyecto.
+# La flash declarada es 2 MB; ajustar en menuconfig si el modulo requiere otra.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+
+# LED convencional GPIO2, activo bajo.
+CONFIG_NAT_STATUS_LED_GPIO=y
+CONFIG_NAT_STATUS_LED_GPIO_NUM=2
+CONFIG_NAT_STATUS_LED_ACTIVE_LOW=y

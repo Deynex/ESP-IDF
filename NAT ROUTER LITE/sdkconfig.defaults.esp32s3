@@ -1,0 +1,17 @@
+# Perfil del ESP32-S3-DevKitC usado en las pruebas: flash fisica de 16 MB.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# LED RGB de la placa probada. DevKitC-1 v1.1 usa GPIO38: ajustar en menuconfig.
+CONFIG_NAT_STATUS_LED_RGB=y
+CONFIG_NAT_STATUS_LED_GPIO_NUM=48
+CONFIG_NAT_STATUS_LED_BRIGHTNESS=8
+
+# Salida de consola tambien por el USB nativo del S3.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Preferencias personalizadas conservadas del respaldo ESP32-S3.
+CONFIG_FREERTOS_IN_IRAM=y
+CONFIG_BOOTLOADER_LOG_COLORS=y
+CONFIG_LOG_COLORS=y

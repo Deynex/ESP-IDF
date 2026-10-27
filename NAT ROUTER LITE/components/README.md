@@ -32,6 +32,8 @@ DNS y LED conservan su código y sus interfaces anteriores, ahora como component
 
 El menú **NAT Router** sigue definido por `main/Kconfig.projbuild`, que incluye los fragmentos `status_led/Kconfig.options` y `wifi/Kconfig.options`. Los símbolos de configuración existentes se conservan.
 
+La configuración común y los perfiles estándar para ESP32/ESP32-S3 están descritos en [CONFIGURACION.md](../CONFIGURACION.md).
+
 ## Verificación
 
 Las pruebas de host y sus comandos están en [tests/README.md](../tests/README.md). La compilación completa comprueba además las dependencias, la resolución del encabezado NVS del SDK y el enlace de los recursos web.

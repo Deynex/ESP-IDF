@@ -1,10 +1,10 @@
 # Migración de NAT ROUTER LITE a ESP32-S3
 
-Comparación de `sdkconfig.old` (ESP32) con `sdkconfig` (ESP32-S3), usando el ESP-IDF 6.1 instalado. El archivo antiguo conserva `CONFIG_IDF_INIT_VERSION="6.0.0"`; algunas diferencias provienen de nuevos valores predeterminados de IDF, y no se puede atribuir cada una a un cambio manual.
+Este documento recoge la comparación original de la migración, realizada cuando `sdkconfig.old` contenía ESP32 y `sdkconfig` contenía ESP32-S3. Es una referencia histórica: esos archivos son generados y su target puede cambiar. La organización actual y los perfiles estándar por chip se explican en [CONFIGURACION.md](CONFIGURACION.md). La configuración original antigua conservaba `CONFIG_IDF_INIT_VERSION="6.0.0"`; algunas diferencias procedían de nuevos valores predeterminados de IDF y no necesariamente de cambios manuales.
 
 ## Configuración necesaria
 
-Desde una terminal de ESP-IDF ejecuta `idf.py reconfigure` y después `idf.py menuconfig`. El target actual ya es `esp32s3`; no hace falta ejecutar `set-target` otra vez.
+Para configurar el S3 desde una terminal de ESP-IDF, selecciona primero `esp32s3` si no es ya el target activo y después ejecuta `idf.py menuconfig`. La selección de target y los perfiles de ambos chips se explican en [CONFIGURACION.md](CONFIGURACION.md); no deduzcas el chip a partir del nombre `sdkconfig.old`.
 
 En **Component config → LWIP**, comprueba estas opciones y actívalas si hace falta:
 
