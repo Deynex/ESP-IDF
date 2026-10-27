@@ -1,6 +1,6 @@
 # Prueba de integración DNS en Windows
 
-Compila **el archivo de producción `main/dns_proxy.c`** con adaptadores mínimos de FreeRTOS, logging y sockets Windows. Las consultas y respuestas viajan por sockets UDP reales en loopback; no se consulta Internet.
+Compila **el archivo de producción `components/dns_proxy/dns_proxy.c`** con adaptadores mínimos de FreeRTOS, logging y sockets Windows. Las consultas y respuestas viajan por sockets UDP reales en loopback; no se consulta Internet.
 
 El adaptador `include/host_socket.h` traduce los endpoints de puerto 53 a **1053 únicamente durante la prueba**. El firmware conserva UDP/53. El puerto 53 de Windows puede estar reservado o filtrado por el entorno de ejecución y no es necesario acceder a él para comprobar el protocolo.
 
@@ -8,7 +8,7 @@ Desde una terminal **x64 Native Tools de Visual Studio**, situada en la raíz de
 
 ```powershell
 New-Item -ItemType Directory -Force build\host-dns | Out-Null
-cl /nologo /std:c11 /experimental:c11atomics /W4 /WX /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_SECURE_NO_WARNINGS /Itests\support\dns_host\include /Imain main\dns_proxy.c tests\support\dns_host\host_main.c /Febuild\host-dns\dns_proxy_host.exe /Fobuild\host-dns\ /link Ws2_32.Lib
+cl /nologo /std:c11 /experimental:c11atomics /W4 /WX /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_SECURE_NO_WARNINGS /Itests\support\dns_host\include /Icomponents\dns_proxy\include components\dns_proxy\dns_proxy.c tests\support\dns_host\host_main.c /Febuild\host-dns\dns_proxy_host.exe /Fobuild\host-dns\ /link Ws2_32.Lib
 python tests\test_dns_proxy_host.py build\host-dns\dns_proxy_host.exe
 ```
 

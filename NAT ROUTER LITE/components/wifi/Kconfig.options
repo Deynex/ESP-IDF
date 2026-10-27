@@ -1,0 +1,9 @@
+    config NAT_ROUTER_FTM_RESPONDER
+        bool "Enable Wi-Fi RTT/FTM responder on the access point"
+        depends on IDF_TARGET_ESP32S3 && ESP_WIFI_FTM_RESPONDER_SUPPORT
+        default n
+        help
+            Allow compatible clients to measure Wi-Fi round-trip time against
+            this access point using the ESP32-S3 FTM hardware support. First
+            enable Component config > Wi-Fi > WiFi FTM and FTM Responder support.
+            This option does not change NAT forwarding or Internet bandwidth.

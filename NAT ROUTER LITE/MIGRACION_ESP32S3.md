@@ -138,3 +138,20 @@ En la prueba con contraseña incorrecta, el controlador informó `WIFI_REASON_4W
 El diagnóstico se conserva durante los reintentos y se limpia al cambiar las credenciales o completar la autenticación. Las desconexiones locales 8/36 provocadas por el cambio de credenciales no se presentan como un fallo de la nueva clave. El aviso depende de cuándo el controlador publique el evento: en la prueba llegó unos 25 segundos después de guardar, tras los reintentos internos.
 
 La prueba de regresión `tests/test_connection_status_page.mjs` verifica la secuencia clave incorrecta → error persistente → credenciales corregidas → espera nueva → conexión correcta, además de las otras causas y la validación de los datos. Pasó con el JavaScript real de la página. Las compilaciones finales pasaron para ESP32-S3 (`0xd9cf0`, 15 % libre) y ESP32 (`0xe7e80`, 9 % libre), ambas en la partición de 1 MB. Logs: `build/validation-s3/build-auth.log` y `build/validation-esp32/build-auth.log`. Queda comprobar los nuevos avisos en la placa.
+
+## Organización en componentes
+
+La aplicación se repartió entre `wifi`, `server`, `nvs`, `dns_proxy` y `status_led`. `main/main.c` pasó de 967 a 21 líneas y solo conserva la secuencia de arranque y la actualización periódica del LED. El detalle de archivos, interfaces y dependencias está en [components/README.md](components/README.md).
+
+`wifi_form.c` y su encabezado están dentro de `components/wifi`, como parte del formulario de configuración Wi-Fi. El servidor conserva todas sus rutas y los recursos originales de `app`. DNS, LED y parser conservan exactamente sus bytes anteriores. Las claves guardadas en NVS y los símbolos del menú `NAT Router` también se conservan. El encabezado público del componente `nvs` se llama `router_nvs.h` para evitar ocultar al `nvs.h` de ESP-IDF.
+
+Se completaron compilaciones desde cero con ESP-IDF 6.1 y copias independientes de configuración:
+
+| Target | Resultado | Binario | Espacio libre en app de 1 MB |
+|---|---|---|---|
+| ESP32-S3 | Correcto | `0xda810` bytes | 15 % |
+| ESP32 | Correcto | `0xe89e0` bytes | 9 % |
+
+Logs: `build/validation-modular-s3/build.log` y `build/validation-modular-esp32/build.log`. Ambas compilaciones incluyen los cinco componentes propios. No se modificaron `sdkconfig`, `sdkconfig.old` ni las particiones durante esta reorganización.
+
+Las pruebas del parser, los siete escenarios UDP del proxy DNS y la regresión de la página de estado pasaron usando las rutas nuevas. Los comandos reproducibles están en [tests/README.md](tests/README.md). La revisión de equivalencia cubrió el orden de arranque, la reconexión, DHCP/NAT/DNS, el diagnóstico de errores y las respuestas HTTP. No se programó la placa durante esta refactorización; queda confirmar en hardware el arranque y la navegación con las credenciales existentes.

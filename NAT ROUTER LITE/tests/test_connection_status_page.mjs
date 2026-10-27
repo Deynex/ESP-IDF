@@ -4,7 +4,7 @@ const fs = await import('node:fs');
 const vm = await import('node:vm');
 const { setImmediate } = await import('node:timers');
 
-const html = fs.readFileSync(new URL('../web%20pages/saved.html', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('../app/saved.html', import.meta.url), 'utf8');
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const baseStatus = {
     credentials_saved: true,

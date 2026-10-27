@@ -1,61 +1,6 @@
 menu "NAT Router"
 
-    choice NAT_STATUS_LED_TYPE
-        prompt "Status LED type"
-        default NAT_STATUS_LED_RGB if IDF_TARGET_ESP32S3
-        default NAT_STATUS_LED_GPIO
-
-        config NAT_STATUS_LED_NONE
-            bool "Disabled"
-
-        config NAT_STATUS_LED_GPIO
-            bool "Conventional GPIO LED"
-
-        config NAT_STATUS_LED_RGB
-            bool "Addressable RGB LED (ESP32-S3 DevKitC)"
-            depends on IDF_TARGET_ESP32S3
-            help
-                Drive one WS2812-compatible GRB LED using the native RMT driver.
-                Green indicates an assigned upstream IP; blinking amber indicates
-                that the router is waiting for an upstream connection.
-    endchoice
-
-    config NAT_STATUS_LED_GPIO_NUM
-        int "Status LED GPIO"
-        depends on !NAT_STATUS_LED_NONE
-        range 0 48 if IDF_TARGET_ESP32S3
-        range 0 33 if IDF_TARGET_ESP32
-        default 48 if IDF_TARGET_ESP32S3
-        default 2
-        help
-            ESP32-S3-DevKitC-1 initial boards use GPIO48; revision 1.1 boards
-            use GPIO38. Select the GPIO matching your board's schematic.
-            A conventional ESP32 board commonly uses GPIO2. The firmware
-            disables the indicator if the selected GPIO cannot be an output.
-
-    config NAT_STATUS_LED_BRIGHTNESS
-        int "RGB LED brightness (1-255)"
-        depends on NAT_STATUS_LED_RGB
-        range 1 255
-        default 8
-
-    config NAT_STATUS_LED_ACTIVE_LOW
-        bool "Conventional LED is active low"
-        depends on NAT_STATUS_LED_GPIO
-        default y
-        help
-            Preserve the original GPIO2 indicator behavior: output LOW while
-            connected and alternate levels while disconnected. Disable this
-            option if the board's LED turns on with output HIGH.
-
-    config NAT_ROUTER_FTM_RESPONDER
-        bool "Enable Wi-Fi RTT/FTM responder on the access point"
-        depends on IDF_TARGET_ESP32S3 && ESP_WIFI_FTM_RESPONDER_SUPPORT
-        default n
-        help
-            Allow compatible clients to measure Wi-Fi round-trip time against
-            this access point using the ESP32-S3 FTM hardware support. First
-            enable Component config > Wi-Fi > WiFi FTM and FTM Responder support.
-            This option does not change NAT forwarding or Internet bandwidth.
+    rsource "../components/status_led/Kconfig.options"
+    rsource "../components/wifi/Kconfig.options"
 
 endmenu
