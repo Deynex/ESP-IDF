@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Credenciales recibidas · NAT Router</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            padding: 24px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #0f0f0f;
+            color: #fff;
+            font-family: Arial, sans-serif;
+            line-height: 1.5;
+        }
+        main {
+            width: 100%;
+            max-width: 420px;
+            padding: 28px 24px;
+            border-radius: 20px;
+            background: #1f1f1f;
+            box-shadow: 10px 10px 15px rgba(0, 0, 0, .5);
+        }
+        .check {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 48px;
+            height: 48px;
+            margin-bottom: 18px;
+            border-radius: 50%;
+            background: #15391c;
+            color: #20fb3a;
+            font-size: 28px;
+        }
+        h1 { margin: 0 0 12px; font-size: 1.65rem; line-height: 1.2; }
+        p { margin: 0; color: #cecece; }
+        .status {
+            margin: 24px 0;
+            padding: 16px;
+            border: 1px solid #48402b;
+            border-radius: 12px;
+            background: #28251e;
+        }
+        .status-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .status h2 { margin: 0; color: #ffcf69; font-size: 1rem; }
+        .status p { font-size: .95rem; }
+        .spinner {
+            display: none;
+            flex: 0 0 18px;
+            width: 18px;
+            height: 18px;
+            border: 2px solid #66512d;
+            border-top-color: #ffcf69;
+            border-radius: 50%;
+            animation: spin .9s linear infinite;
+        }
+        .status[data-state="waiting"] .spinner { display: block; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            .spinner { animation: none; border-style: dotted; }
+        }
+        .status[data-state="ready"] { border-color: #265e30; background: #172b1c; }
+        .status[data-state="ready"] h2 { color: #63ee78; }
+        .status[data-state="error"] { border-color: #6a3d38; background: #30211f; }
+        .status[data-state="error"] h2 { color: #ffb3a8; }
+        .actions { display: flex; flex-direction: column; gap: 12px; }
+        a {
+            display: block;
+            padding: 12px 14px;
+            border: 0;
+            border-radius: 10px;
+            font: inherit;
+            font-weight: bold;
+            text-align: center;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        a { color: #00330c; background: linear-gradient(315deg, #20fb3a, #00e61f); }
+        a:hover { background: #00c924; }
+        a:focus-visible { outline: 3px solid #a0ffad; outline-offset: 3px; }
+        .hint { margin-top: 20px; color: #aaa; font-size: .85rem; }
+        noscript p { margin-top: 16px; color: #ffcf69; }
+    </style>
+</head>
+
+<body>
+    <main>
+        <div class="check" aria-hidden="true">✓</div>
+        <h1 id="confirmation-title">Credenciales recibidas</h1>
+        <p id="confirmation-text">El ESP guardó correctamente el nombre de la red y la contraseña.</p>
+
+        <section id="status" class="status" data-state="waiting" role="status" aria-live="polite" aria-atomic="true">
+            <div class="status-heading">
+                <span class="spinner" aria-hidden="true"></span>
+                <h2 id="status-title">Conectando al módem…</h2>
+            </div>
+            <p id="status-text">Espera unos segundos mientras el ESP establece la conexión. Esta página actualizará el estado automáticamente.</p>
+        </section>
+
+        <div class="actions">
+            <a href="/">Cambiar credenciales</a>
+        </div>
+        <p class="hint">Si perdiste la conexión, vuelve a conectarte a ESP32-NAT y abre 192.168.2.1/saved.</p>
+        <noscript><p>Activa JavaScript para ver el estado de la conexión automáticamente. Las credenciales ya se guardaron.</p></noscript>
+    </main>
+
+    <script>
+        const statusBox = document.getElementById('status');
+        const statusTitle = document.getElementById('status-title');
+        const statusText = document.getElementById('status-text');
+        let waitingSince = Date.now();
+        let pollTimer;
+        let inFlight = false;
+
+        function showStatus(state, title, text) {
+            statusBox.dataset.state = state;
+            statusTitle.textContent = title;
+            statusText.textContent = text;
+        }
+
+        async function updateStatus() {
+            if (inFlight) return;
+            clearTimeout(pollTimer);
+            inFlight = true;
+            let nextPoll = 2000;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+
+            try {
+                const response = await fetch('/api/status', { cache: 'no-store', signal: controller.signal });
+                if (!response.ok) throw new Error('Status request failed');
+                const status = await response.json();
+                const fields = ['credentials_saved', 'connected', 'nat_enabled', 'dns_ready', 'subnet_conflict'];
+                if (!fields.every(field => typeof status[field] === 'boolean')) throw new Error('Invalid status');
+
+                if (!status.credentials_saved) {
+                    document.getElementById('confirmation-title').textContent = 'Configura tu red Wi-Fi';
+                    document.getElementById('confirmation-text').textContent = 'No hay credenciales guardadas en este equipo.';
+                    showStatus('idle', 'Faltan los datos de tu red', 'Abre el formulario para indicar el nombre de la red y la contraseña.');
+                    nextPoll = 10000;
+                } else if (status.subnet_conflict) {
+                    showStatus('error', 'Las redes coinciden', 'La red del módem coincide con la del ESP. Cambia la red del punto de acceso.');
+                } else if (!status.connected) {
+                    if (waitingSince === null) waitingSince = Date.now();
+                    const takingLonger = Date.now() - waitingSince >= 30000;
+                    showStatus('waiting', takingLonger ? 'La conexión sigue pendiente' : 'Conectando al módem…',
+                        takingLonger
+                            ? 'El ESP sigue intentando conectarse. Verifica que el módem esté encendido y que el nombre de la red y la contraseña sean correctos.'
+                            : 'Espera unos segundos mientras el ESP establece la conexión. Esta página actualizará el estado automáticamente.');
+                } else if (!status.nat_enabled || !status.dns_ready) {
+                    showStatus('waiting', 'Conexión compartida pendiente', 'El ESP ya se conectó al módem, pero no se pudo preparar la conexión compartida. Revisa la configuración del router.');
+                } else {
+                    waitingSince = null;
+                    showStatus('ready', 'Conexión al módem establecida', 'El router está listo para que pruebes el acceso a Internet.');
+                    nextPoll = 10000;
+                }
+            } catch (error) {
+                showStatus('waiting', 'No se pudo actualizar el estado', 'Si perdiste la conexión, vuelve a conectarte a ESP32-NAT y abre 192.168.2.1/saved. Se volverá a intentar automáticamente.');
+            } finally {
+                clearTimeout(timeout);
+                inFlight = false;
+                pollTimer = setTimeout(updateStatus, nextPoll);
+            }
+        }
+
+        updateStatus();
+    </script>
+</body>
+
+</html>

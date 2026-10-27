@@ -1,4 +1,10 @@
-#include "driver/gpio.h"
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "dns_proxy.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -6,29 +12,15 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
-#include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_tls.h"
-#include "esp_tls_crypto.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
-#include "lwip/err.h"
 #include "lwip/inet.h"
-#include "lwip/netdb.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include <sys/param.h>
-#include <stdbool.h>
-#if IP_NAPT
-#include "lwip/lwip_napt.h"
-#endif
-
-// Definiciones de pines
-#define BUILD_LED GPIO_NUM_2 // LED conectado al pin GPIO 2
+#include "status_led.h"
+#include "wifi_form.h"
 
 // Definiciones de NVS
 #define WIFI_NAMESPACE "wifi"
@@ -37,7 +29,7 @@
 #define WIFI_AP_SSID "ESP32-NAT"
 #define WIFI_AP_PASS "12345678"
 #define WIFI_AP_MAX_STA_CONN 3
-#define WIFI_AP_CHANNEL 0
+#define WIFI_AP_CHANNEL 1
 #define WIFI_AP_IP "192.168.2.1" // También se usa como gateway (Netmask: 255.255.255.0)
 
 // Definiciones WiFi STA
@@ -47,64 +39,59 @@
 #define WIFI_STA_RECONNECT_TIMEOUT 3
 
 // Tags para logging
-static const char *TAG_GPIO = "GPIO";
 static const char *TAG_TIMER = "TIMER";
-// static const char *TAG_ISR = "ISR";
-// static const char *TAG_QUEUE = "QUEUE";
 static const char *TAG_NVS = "NVS";
 static const char *TAG_WIFI = "WIFI";
 static const char *TAG_AP = "WIFI_AP";
 static const char *TAG_STA = "WIFI_STA";
 static const char *TAG_HTTP = "WEB_SERVER";
 
-// Estructuras
-typedef struct
-{
-    uint8_t num;
-    gpio_mode_t mode;
-    uint8_t state;
-} digital_pin;
+// Serializa conexión y cambios de credenciales en la tarea de eventos.
+ESP_EVENT_DEFINE_BASE(ROUTER_EVENT);
+enum { ROUTER_CONNECT, ROUTER_UPDATE_CREDENTIALS };
 
 // Variables globales
 static esp_timer_handle_t reconnect_timer = NULL;
 static esp_netif_t *esp_netif_ap = NULL;
 static esp_netif_t *esp_netif_sta = NULL;
-static char *ssid = NULL;
-static char *password = NULL;
-static int auth_mode_index = 6;
-static bool esp_connected = false;
+static atomic_bool esp_connected = false;
+static atomic_bool credentials_saved = false;
+static atomic_bool nat_enabled = false;
+static atomic_bool subnet_conflict = false;
+static bool credentials_pending = false; // Solo se accede desde la tarea de eventos.
 static httpd_handle_t server_handle = NULL;
 
 // Declaración de funciones principales
-static void configure_digital_pin(digital_pin *pin);                                                             // Configura un pin GPIO
 static void configure_timer(const char *name, esp_timer_handle_t *timer_handle, esp_timer_cb_t reconnect_timer); // Inicia un timer
 static void nvs_start(void);                                                                                     // Inicializa el almacenamiento no volátil
 static void wifi_start(void);                                                                                    // Inicializa el WiFi
 esp_netif_t *wifi_ap_start(void);                                                                                // Inicializa el punto de acceso WiFi
 esp_netif_t *wifi_sta_start(void);                                                                               // Inicializa el cliente WiFi
-static void get_wifi_credentials(char **ssid, char **password);                                                  // Guarda las credenciales de WiFi en el almacenamiento no volátil
+static bool get_wifi_credentials(char ssid[33], char password[65]);
 static void configure_http_server(void);                                                                         // Configura el servidor HTTP
-static void toggle_pin(digital_pin *pin);                                                                        // Cambia el estado de un pin GPIO
 
 // Declaración de funciones de eventos en el WiFi
 static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event);   // Manejador de eventos de desconexión del cliente WiFi
-static void change_sta_authmode_threshold(void);                                    // Manejador de eventos de no encontrar AP en el umbral de autenticación
-static void update_wifi_credentials(void);                                          // Manejador de eventos comunes de desconexión del cliente WiFi
+static bool update_wifi_credentials(void);
 static void wifi_reconnect(void);                                                   // Reintenta la conexión WiFi
-static void ap_set_dns_addr(esp_netif_t *esp_netif_ap, esp_netif_t *esp_netif_sta); // Establece la dirección DNS en el punto de acceso
+static void update_dns_upstream(void);
+static void router_mark_offline(void);
 
 // Declaración de manejadores del web server
 static esp_err_t main_handler(httpd_req_t *req);    // Manejador de la página principal
 static esp_err_t favicon_handler(httpd_req_t *req); // Manejador del favicon
 static esp_err_t post_handler(httpd_req_t *req);    // Manejador de la petición POST
+static esp_err_t saved_handler(httpd_req_t *req);
+static esp_err_t status_handler(httpd_req_t *req);
 
 // Declaración de funciones del web server
-static void url_decode(char *dst, const char *src);            // Decodifica una URL
-static void save_wifi_credentials(char *ssid, char *password); // Obtiene las credenciales de WiFi del almacenamiento no volátil
+static esp_err_t save_wifi_credentials(const char *ssid, const char *password);
 
 // Paginas web
 extern const uint8_t main_html_start[] asm("_binary_main_html_start");
 extern const uint8_t main_html_end[] asm("_binary_main_html_end");
+extern const uint8_t saved_html_start[] asm("_binary_saved_html_start");
+extern const uint8_t saved_html_end[] asm("_binary_saved_html_end");
 
 // Imagenes e iconos
 extern const uint8_t router_ico_start[] asm("_binary_router_ico_start");
@@ -113,16 +100,59 @@ extern const uint8_t router_ico_end[] asm("_binary_router_ico_end");
 // MARK: CALLBACKS ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 static void reconnect_cb(void *arg)
 {
-    esp_err_t err = esp_wifi_connect();
+    esp_err_t err = esp_event_post(ROUTER_EVENT, ROUTER_CONNECT, NULL, 0, 0);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_TIMER, "Error al conectar al WiFi. Error %s", esp_err_to_name(err));
+        ESP_LOGE(TAG_TIMER, "Error al programar conexión: %s", esp_err_to_name(err));
+        wifi_reconnect();
     }
 }
 
 // MARK: EVENTOS -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
+    if (event_base == ROUTER_EVENT)
+    {
+        if (event_id == ROUTER_UPDATE_CREDENTIALS)
+        {
+            router_mark_offline();
+            esp_timer_stop(reconnect_timer);
+            credentials_pending = true;
+            esp_err_t err = esp_wifi_disconnect();
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG_STA, "Desconexión para actualizar credenciales: %s", esp_err_to_name(err));
+            }
+            if (err == ESP_OK)
+            {
+                credentials_pending = !update_wifi_credentials();
+            }
+            wifi_reconnect();
+        }
+        else if (event_id == ROUTER_CONNECT && !atomic_load(&esp_connected))
+        {
+            if (credentials_pending)
+            {
+                esp_err_t err = esp_wifi_disconnect();
+                if (err != ESP_OK || !update_wifi_credentials())
+                {
+                    wifi_reconnect();
+                    return;
+                }
+                credentials_pending = false;
+                wifi_reconnect();
+                return;
+            }
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG_STA, "No se pudo iniciar la conexión: %s; reintentando", esp_err_to_name(err));
+                wifi_reconnect();
+            }
+        }
+        return;
+    }
+
     if (event_base == WIFI_EVENT)
     {
         switch (event_id)
@@ -158,25 +188,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(TAG_AP, "Punto de acceso WiFi detenido");
             break;
         case WIFI_EVENT_STA_START:
-            ESP_LOGI(TAG_STA, "Cliente WiFi iniciado, conectando a la red...");
-            esp_err_t err = esp_wifi_connect();
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG_STA, "Error al conectar al WiFi. Error %s", esp_err_to_name(err));
-            }
+            // En APSTA este evento puede llegar antes de terminar esp_wifi_start().
+            ESP_LOGI(TAG_STA, "Cliente WiFi iniciado");
             break;
         case WIFI_EVENT_STA_CONNECTED:
         {
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
             ESP_LOGI(TAG_STA, "Conectado a la red. MAC: " MACSTR ", AID: %d", MAC2STR(event->bssid), event->aid);
-            esp_connected = 1;
+            if (!credentials_pending)
+            {
+                esp_timer_stop(reconnect_timer);
+            }
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED:
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
-            esp_connected = 0;
+            router_mark_offline();
 
             sta_disconnected_event_handler(event);
             break;
@@ -185,6 +214,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGW(TAG_STA, "Tiempo de espera de beacon agotado");
             break;
         case WIFI_EVENT_STA_STOP:
+            router_mark_offline();
+            esp_timer_stop(reconnect_timer);
             ESP_LOGI(TAG_STA, "Cliente WiFi detenido");
             break;
         default:
@@ -199,7 +230,30 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         case IP_EVENT_STA_GOT_IP:
         {
             ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+            if (credentials_pending)
+            {
+                wifi_reconnect();
+                break;
+            }
             ESP_LOGI(TAG_STA, "Dirección IP asignada. IP: " IPSTR ", Máscara: " IPSTR ", Gateway: " IPSTR, IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask), IP2STR(&event->ip_info.gw));
+            atomic_store(&esp_connected, true);
+            esp_timer_stop(reconnect_timer);
+
+            esp_netif_ip_info_t ap_ip;
+            ESP_ERROR_CHECK(esp_netif_get_ip_info(esp_netif_ap, &ap_ip));
+            bool overlap = (event->ip_info.ip.addr & ap_ip.netmask.addr) == (ap_ip.ip.addr & ap_ip.netmask.addr)
+                || (event->ip_info.ip.addr & event->ip_info.netmask.addr) == (ap_ip.ip.addr & event->ip_info.netmask.addr);
+            atomic_store(&subnet_conflict, overlap);
+            if (overlap)
+            {
+                ESP_LOGE(TAG_WIFI, "Las subredes STA y AP se superponen; cambie WIFI_AP_IP antes de usar NAT");
+                atomic_store(&nat_enabled, false);
+                dns_proxy_set_upstream(0);
+#if CONFIG_LWIP_IPV4_NAPT
+                ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_napt_disable(esp_netif_ap));
+#endif
+                break;
+            }
 
             esp_err_t err = esp_netif_set_default_netif(esp_netif_sta);
             if (err != ESP_OK)
@@ -207,20 +261,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGE(TAG_WIFI, "Error al establecer la interfaz de red por defecto. Error %s", esp_err_to_name(err));
             }
 
-#if IP_NAPT
+#if CONFIG_LWIP_IPV4_NAPT
             err = esp_netif_napt_enable(esp_netif_ap);
             if (err != ESP_OK)
             {
                 ESP_LOGE(TAG_WIFI, "Error al habilitar el NAT en la interfaz de red del punto de acceso. Error %s", esp_err_to_name(err));
+                atomic_store(&nat_enabled, false);
+            }
+            else
+            {
+                ESP_LOGI(TAG_WIFI, "NAPT habilitado en el punto de acceso");
+                atomic_store(&nat_enabled, true);
             }
 #else
             ESP_LOGW(TAG_WIFI, "El soporte NAPT no está habilitado en la configuración de lwIP");
 #endif
 
-            ap_set_dns_addr(esp_netif_ap, esp_netif_sta);
+            update_dns_upstream();
             break;
         }
         case IP_EVENT_STA_LOST_IP:
+            router_mark_offline();
             ESP_LOGW(TAG_STA, "Dirección IP perdida");
             break;
         case IP_EVENT_ASSIGNED_IP_TO_CLIENT:
@@ -250,10 +311,12 @@ static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
     switch (event->reason)
     {
     case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
-        change_sta_authmode_threshold();
+        ESP_LOGW(TAG_STA, "La red no cumple el umbral WPA2/WPA3 configurado");
+        wifi_reconnect();
         break;
     case WIFI_REASON_NO_AP_FOUND:
         ESP_LOGW(TAG_STA, "Punto de acceso no encontrado");
+        wifi_reconnect();
         break;
     case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
         ESP_LOGW(TAG_STA, "Tiempo de espera del handshake de 4 vías agotado");
@@ -264,8 +327,8 @@ static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
         wifi_reconnect();
         break;
     case WIFI_REASON_STA_LEAVING:
-        ESP_LOGI(TAG_STA, "Desconexión local o red no encontrada, actualizando credenciales y reconectando...");
-        update_wifi_credentials();
+        ESP_LOGI(TAG_STA, "Desconexión local, programando reconexión...");
+        wifi_reconnect();
         break;
     case WIFI_REASON_AUTH_EXPIRE:
         ESP_LOGW(TAG_STA, "La autenticación ha expirado");
@@ -294,40 +357,33 @@ static void sta_disconnected_event_handler(wifi_event_sta_disconnected_t *event)
     }
 }
 
-static void change_sta_authmode_threshold(void)
+static bool update_wifi_credentials(void)
 {
-    if (auth_mode_index < WIFI_AUTH_MAX)
+    wifi_config_t wifi_config = {0};
+    char ssid[33] = {0};
+    char password[65] = {0};
+    if (get_wifi_credentials(ssid, password))
     {
-        wifi_config_t wifi_config;
-        ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
-
-        wifi_config.sta.threshold.authmode = (wifi_auth_mode_t)auth_mode_index++;
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-        ESP_ERROR_CHECK(esp_wifi_disconnect());
-        ESP_ERROR_CHECK(esp_wifi_connect());
-    }
-    else
-    {
-        ESP_LOGW(TAG_STA, "Todos los modos de autenticación han sido probados.");
-        auth_mode_index = 0; // Reiniciar el índice para futuros intentos
-    }
-}
-
-static void update_wifi_credentials(void)
-{
-    wifi_config_t wifi_config;
-    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
-
-    get_wifi_credentials(&ssid, &password);
-    if (ssid && password)
-    {
-        strcpy((char *)wifi_config.sta.ssid, ssid);
-        strcpy((char *)wifi_config.sta.password, password);
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG_STA, "No se pudo leer la configuración WiFi: %s", esp_err_to_name(err));
+            return false;
+        }
+        memset(wifi_config.sta.ssid, 0, sizeof(wifi_config.sta.ssid));
+        memset(wifi_config.sta.password, 0, sizeof(wifi_config.sta.password));
+        memcpy(wifi_config.sta.ssid, ssid, strlen(ssid));
+        memcpy(wifi_config.sta.password, password, strlen(password));
+        err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG_STA, "No se pudieron aplicar las credenciales: %s", esp_err_to_name(err));
+            return false;
+        }
+        return true;
     }
 
-    wifi_reconnect();
+    return false;
 }
 
 static void wifi_reconnect(void)
@@ -344,15 +400,43 @@ static void wifi_reconnect(void)
     }
 }
 
-static void ap_set_dns_addr(esp_netif_t *esp_netif_ap, esp_netif_t *esp_netif_sta)
+static void router_mark_offline(void)
 {
-    esp_netif_dns_info_t dns;
-    esp_netif_get_dns_info(esp_netif_sta, ESP_NETIF_DNS_MAIN, &dns);
-    uint8_t dhcps_offer_option = 0x02;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(esp_netif_ap));
-    ESP_ERROR_CHECK(esp_netif_dhcps_option(esp_netif_ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_offer_option, sizeof(dhcps_offer_option)));
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_ap, ESP_NETIF_DNS_MAIN, &dns));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(esp_netif_ap));
+    atomic_store(&esp_connected, false);
+    atomic_store(&nat_enabled, false);
+    atomic_store(&subnet_conflict, false);
+    dns_proxy_set_upstream(0);
+#if CONFIG_LWIP_IPV4_NAPT
+    if (esp_netif_ap)
+    {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_napt_disable(esp_netif_ap));
+    }
+#endif
+}
+
+static void update_dns_upstream(void)
+{
+    // El DNS anunciado por DHCP siempre es WIFI_AP_IP; solo cambia su destino.
+    const esp_netif_dns_type_t types[] = {ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP, ESP_NETIF_DNS_FALLBACK};
+    const uint32_t ap_addr = ipaddr_addr(WIFI_AP_IP);
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i)
+    {
+        esp_netif_dns_info_t dns = {0};
+        if (esp_netif_get_dns_info(esp_netif_sta, types[i], &dns) == ESP_OK
+            && dns.ip.type == ESP_IPADDR_TYPE_V4)
+        {
+            uint32_t address = dns.ip.u_addr.ip4.addr;
+            uint32_t host = ntohl(address);
+            if (address != ap_addr && (host >> 24) != 0 && host < 0xe0000000U && (host >> 24) != 127)
+            {
+                dns_proxy_set_upstream(address);
+                ESP_LOGI(TAG_WIFI, "DNS del módem para los clientes: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+                return;
+            }
+        }
+    }
+    dns_proxy_set_upstream(ipaddr_addr("1.1.1.1"));
+    ESP_LOGW(TAG_WIFI, "El módem no proporcionó DNS IPv4 válido; usando 1.1.1.1");
 }
 
 static void http_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -400,9 +484,11 @@ static void http_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 // MARK: MAIN ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void app_main(void)
 {
-    // Configura los pines GPIO
-    digital_pin build_led = {BUILD_LED, GPIO_MODE_OUTPUT, 1};
-    configure_digital_pin(&build_led);
+    status_led_init();
+
+#if !CONFIG_LWIP_IPV4_NAPT
+    ESP_LOGW(TAG_WIFI, "Active LWIP_IP_FORWARD y LWIP_IPV4_NAPT en menuconfig para compartir Internet");
+#endif
 
     // Inicia el timer
     configure_timer("reconnect_timer", &reconnect_timer, reconnect_cb);
@@ -419,39 +505,12 @@ void app_main(void)
     // Bucle principal
     while (true)
     {
-        if (esp_connected)
-        {
-            if (build_led.state == 1)
-            {
-                toggle_pin(&build_led);
-            }
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-        }
-        else
-        {
-            toggle_pin(&build_led);
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-        }
+        status_led_update(atomic_load(&esp_connected));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
 // MARK: FUNCIONES -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-// Configura un pin GPIO
-static void configure_digital_pin(digital_pin *pin)
-{
-    esp_err_t err = gpio_reset_pin(pin->num);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_GPIO, "Error al reiniciar el pin GPIO %d. Error %s", pin->num, esp_err_to_name(err));
-    }
-
-    err = gpio_set_direction(pin->num, pin->mode);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_GPIO, "Error al configurar el pin GPIO %d. Error %s", pin->num, esp_err_to_name(err));
-    }
-}
 
 static void configure_timer(const char *name, esp_timer_handle_t *timer_handle, esp_timer_cb_t reconnect_timer)
 {
@@ -462,11 +521,7 @@ static void configure_timer(const char *name, esp_timer_handle_t *timer_handle, 
         .name = name,
     };
 
-    esp_err_t err = esp_timer_create(&config, timer_handle); // Pasar la dirección de timer_handle
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_TIMER, "Error al crear el timer. Error %s", esp_err_to_name(err));
-    }
+    ESP_ERROR_CHECK(esp_timer_create(&config, timer_handle));
 }
 
 static void nvs_start(void)
@@ -495,6 +550,7 @@ static void wifi_start(void)
     // Registra el manejador de eventos de WiFi
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(ROUTER_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
 
     // Inicializa el controlador WiFi
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -509,8 +565,13 @@ static void wifi_start(void)
     // Inicia el cliente STA
     esp_netif_sta = wifi_sta_start();
 
+    // El listener existe antes de que el primer cliente pueda obtener un lease.
+    ESP_ERROR_CHECK(dns_proxy_start(ipaddr_addr(WIFI_AP_IP)));
+
     // Inicia el controlador WiFi
     ESP_ERROR_CHECK(esp_wifi_start());
+    // No conectar en STA_START: esp_wifi_start() debe haber terminado en APSTA.
+    ESP_ERROR_CHECK(esp_event_post(ROUTER_EVENT, ROUTER_CONNECT, NULL, 0, portMAX_DELAY));
 }
 
 esp_netif_t *wifi_ap_start(void)
@@ -528,7 +589,18 @@ esp_netif_t *wifi_ap_start(void)
     // Detiene y reinicia el servidor DHCP
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(esp_netif_ap));
     ESP_ERROR_CHECK(esp_netif_set_ip_info(esp_netif_ap, &ip_info));
+    esp_netif_dns_info_t dns = {
+        .ip = {
+            .u_addr.ip4 = ip_info.ip,
+            .type = ESP_IPADDR_TYPE_V4,
+        },
+    };
+    uint8_t dhcps_offer_dns = 0x02;
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_ap, ESP_NETIF_DNS_MAIN, &dns));
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(esp_netif_ap, ESP_NETIF_OP_SET,
+                                         ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_offer_dns, sizeof(dhcps_offer_dns)));
     ESP_ERROR_CHECK(esp_netif_dhcps_start(esp_netif_ap));
+    ESP_LOGI(TAG_AP, "DHCP anuncia DNS " IPSTR " desde el arranque", IP2STR(&ip_info.ip));
 
     // Configura el punto de acceso WiFi
     wifi_config_t wifi_config = {
@@ -545,7 +617,9 @@ esp_netif_t *wifi_ap_start(void)
 #else
                 .authmode = WIFI_AUTH_WPA2_PSK,
 #endif
-                .ftm_responder = 0,
+#if CONFIG_NAT_ROUTER_FTM_RESPONDER
+                .ftm_responder = true,
+#endif
                 .pmf_cfg =
                     {
                         .required = 1,
@@ -560,7 +634,10 @@ esp_netif_t *wifi_ap_start(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
 
-    ESP_LOGI(TAG_AP, "WiFi AP iniciado. SSID: %s, PASS: %s, CANAL: %d", WIFI_AP_SSID, WIFI_AP_PASS, WIFI_AP_CHANNEL);
+    ESP_LOGI(TAG_AP, "WiFi AP configurado. SSID: %s, CANAL inicial: %d", WIFI_AP_SSID, WIFI_AP_CHANNEL);
+#if CONFIG_NAT_ROUTER_FTM_RESPONDER
+    ESP_LOGI(TAG_AP, "FTM responder habilitado: disponible para clientes WiFi RTT compatibles");
+#endif
 
     return esp_netif_ap;
 }
@@ -583,120 +660,55 @@ esp_netif_t *wifi_sta_start(void)
             },
     };
 
-    // Obtiene las credenciales de WiFi del almacenamiento no volátil
-    get_wifi_credentials(&ssid, &password);
+    char ssid[33] = {0};
+    char password[65] = {0};
 
     // Si no se encuentran credenciales, se usan las predeterminadas
-    if (ssid == NULL || password == NULL)
+    if (!get_wifi_credentials(ssid, password))
     {
         strncpy((char *)wifi_config.sta.ssid, WIFI_STA_SSID_DEFAULT, sizeof(wifi_config.sta.ssid) - 1);
         strncpy((char *)wifi_config.sta.password, WIFI_STA_PASS_DEFAULT, sizeof(wifi_config.sta.password) - 1);
     }
     else
     {
-        strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
-        strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+        atomic_store(&credentials_saved, true);
+        memcpy(wifi_config.sta.ssid, ssid, strlen(ssid));
+        memcpy(wifi_config.sta.password, password, strlen(password));
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    ESP_LOGI(TAG_STA, "WiFi STA iniciado. SSID: %s, PASS: %s", wifi_config.sta.ssid, wifi_config.sta.password);
+    ESP_LOGI(TAG_STA, "WiFi STA configurado. SSID: %.*s", (int)sizeof(wifi_config.sta.ssid), wifi_config.sta.ssid);
 
     return esp_netif_sta;
 }
 
-static void get_wifi_credentials(char **ssid, char **password)
+static bool get_wifi_credentials(char ssid[33], char password[65])
 {
     nvs_handle_t nvs_handle_wifi;
-    esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
+    esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs_handle_wifi);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil. Error %s", esp_err_to_name(err));
-        if (err == ESP_ERR_NVS_NOT_FOUND)
-        {
-            ESP_LOGW(TAG_NVS, "Creando espacio de almacenamiento no volátil...");
-            err = nvs_flash_init_partition(WIFI_NAMESPACE);
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG_NVS, "Error al inicializar el espacio de almacenamiento no volátil. Error %s", esp_err_to_name(err));
-            }
-            else
-            {
-                ESP_LOGI(TAG_NVS, "Espacio de almacenamiento no volátil creado correctamente");
-                err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
-                if (err != ESP_OK)
-                {
-                    ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil después de la creación. Error %s", esp_err_to_name(err));
-                }
-            }
-        }
+        ESP_LOGW(TAG_NVS, "Credenciales no disponibles: %s", esp_err_to_name(err));
+        return false;
     }
 
-    size_t ssid_len = 0;
-    err = nvs_get_str(nvs_handle_wifi, "ssid", NULL, &ssid_len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) // Si no se encuentra la clave, no se muestra el error
+    size_t ssid_len = 33;
+    size_t password_len = 65;
+    err = nvs_get_str(nvs_handle_wifi, "ssid", ssid, &ssid_len);
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG_NVS, "Error al obtener la longitud del SSID del almacenamiento no volátil. Error %s", esp_err_to_name(err));
+        err = nvs_get_str(nvs_handle_wifi, "password", password, &password_len);
     }
-
-    size_t password_len = 0;
-    err = nvs_get_str(nvs_handle_wifi, "password", NULL, &password_len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
-    {
-        ESP_LOGE(TAG_NVS, "Error al obtener la longitud de la contraseña del almacenamiento no volátil. Error %s", esp_err_to_name(err));
-    }
-
-    if (ssid_len > 0 && password_len > 0)
-    {
-        if (*ssid)
-        {
-            free(*ssid);
-            *ssid = NULL;
-        }
-        if (*password)
-        {
-            free(*password);
-            *password = NULL;
-        }
-
-        *ssid = malloc(ssid_len);
-        *password = malloc(password_len);
-
-        err = nvs_get_str(nvs_handle_wifi, "ssid", *ssid, &ssid_len);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG_NVS, "Error al obtener el SSID del almacenamiento no volátil. Error %s", esp_err_to_name(err));
-        }
-
-        err = nvs_get_str(nvs_handle_wifi, "password", *password, &password_len);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG_NVS, "Error al obtener la contraseña del almacenamiento no volátil. Error %s", esp_err_to_name(err));
-        }
-    }
-    else
-    {
-        ESP_LOGW(TAG_NVS, "No se encontraron credenciales de WiFi en el almacenamiento no volátil");
-    }
-
     nvs_close(nvs_handle_wifi);
-}
-
-static void toggle_pin(digital_pin *pin)
-{
-    if (pin->mode == GPIO_MODE_OUTPUT)
+    if (err != ESP_OK || ssid_len < 2 || password_len < 9)
     {
-        pin->state = !pin->state;
-        esp_err_t err = gpio_set_level(pin->num, pin->state);
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(TAG_GPIO, "Error al cambiar el estado del pin GPIO %d. Error %s", pin->num, esp_err_to_name(err));
-        }
+        ESP_LOGW(TAG_NVS, "No hay credenciales WiFi válidas guardadas");
+        ssid[0] = '\0';
+        password[0] = '\0';
+        return false;
     }
-    else
-    {
-        ESP_LOGW(TAG_GPIO, "El pin GPIO %d no está configurado como salida", pin->num);
-    }
+    return true;
 }
 
 // MARK: HTTP SERVER -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -705,6 +717,9 @@ static void configure_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
+    // HTTP usa tres sockets internos; quedan dos para el proxy DNS.
+    config.max_open_sockets = 4;
+    config.lru_purge_enable = true;
 
     ESP_LOGI(TAG_HTTP, "Iniciando servidor web en puerto: %d", config.server_port);
 
@@ -739,6 +754,19 @@ static void configure_http_server(void)
             .user_ctx = NULL,
         };
         httpd_register_uri_handler(server_handle, &uri_post);
+
+        const httpd_uri_t uri_saved = {
+            .uri = "/saved",
+            .method = HTTP_GET,
+            .handler = saved_handler,
+        };
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server_handle, &uri_saved));
+        const httpd_uri_t uri_status = {
+            .uri = "/api/status",
+            .method = HTTP_GET,
+            .handler = status_handler,
+        };
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server_handle, &uri_status));
     }
     else
     {
@@ -751,8 +779,7 @@ static esp_err_t main_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");         // No almacenar en caché
     httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff"); // No permitir la interpretación de MIME
     httpd_resp_set_type(req, "text/html; charset=utf-8");         // Tipo de contenido
-    httpd_resp_send(req, (const char *)main_html_start, main_html_end - main_html_start);
-    return ESP_OK;
+    return httpd_resp_send(req, (const char *)main_html_start, main_html_end - main_html_start - 1);
 }
 
 static esp_err_t favicon_handler(httpd_req_t *req)
@@ -764,14 +791,48 @@ static esp_err_t favicon_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t saved_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!atomic_load(&credentials_saved))
+    {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, (const char *)saved_html_start, saved_html_end - saved_html_start - 1);
+}
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    char response[192];
+    snprintf(response, sizeof(response),
+             "{\"credentials_saved\":%s,\"connected\":%s,\"nat_enabled\":%s,\"dns_ready\":%s,\"subnet_conflict\":%s}",
+             atomic_load(&credentials_saved) ? "true" : "false",
+             atomic_load(&esp_connected) ? "true" : "false",
+             atomic_load(&nat_enabled) ? "true" : "false",
+             dns_proxy_is_ready() ? "true" : "false",
+             atomic_load(&subnet_conflict) ? "true" : "false");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, response);
+}
+
 static esp_err_t post_handler(httpd_req_t *req)
 {
-    char buf[256];
-    int ret, remaining = req->content_len;
-
-    while (remaining > 0)
+    // 32 + 64 bytes pueden ocupar 3 veces su tamaño al codificarse como %xx.
+    char buf[320] = {0};
+    if (req->content_len == 0 || req->content_len >= sizeof(buf))
     {
-        if ((ret = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf) - 1))) <= 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Formulario vacío o demasiado largo");
+    }
+    size_t received = 0;
+    while (received < req->content_len)
+    {
+        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (ret <= 0)
         {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT)
             {
@@ -779,97 +840,56 @@ static esp_err_t post_handler(httpd_req_t *req)
             }
             return ESP_FAIL;
         }
-        remaining -= ret;
-        buf[ret] = '\0'; // Asegurarse de que el buffer esté terminado con un carácter nulo
+        received += ret;
     }
-
-    char decoded_buf[256];
-    url_decode(decoded_buf, buf);
-
-    printf("Datos recibidos: %s\n", decoded_buf);
-
-    // Parsear los datos recibidos para extraer ssid y password
-    char ssid[32] = {0};
-    char password[64] = {0};
-
-    // ESP-IDF buscará las claves directamente en el string decodificado
-    httpd_query_key_value(decoded_buf, "ssid", ssid, sizeof(ssid));
-    httpd_query_key_value(decoded_buf, "password", password, sizeof(password));
-
-    // Guardar las credenciales de WiFi en la memoria no volátil
-    save_wifi_credentials(ssid, password);
-
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, (const char *)main_html_start, main_html_end - main_html_start);
-    ESP_LOGI(TAG_HTTP, "Nuevas credenciales guardadas. Reiniciando conexión STA...");
-    esp_wifi_disconnect();
-    return ESP_OK;
-}
-
-// Función para decodificar URL
-static void url_decode(char *dst, const char *src)
-{
-    char a, b;
-    while (*src)
+    char ssid[33] = {0};
+    char password[65] = {0};
+    if (memchr(buf, '\0', received) || !wifi_form_parse(buf, ssid, password))
     {
-        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b)))
-        {
-            if (a >= 'a')
-                a -= 'a' - 'A';
-            if (a >= 'A')
-                a -= ('A' - 10);
-            else
-                a -= '0';
-            if (b >= 'a')
-                b -= 'a' - 'A';
-            if (b >= 'A')
-                b -= ('A' - 10);
-            else
-                b -= '0';
-            *dst++ = 16 * a + b;
-            src += 3;
-        }
-        else if (*src == '+')
-        {
-            *dst++ = ' ';
-            src++;
-        }
-        else
-        {
-            *dst++ = *src++;
-        }
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID o clave WPA inválidos");
     }
-    *dst = '\0';
+
+    if (save_wifi_credentials(ssid, password) != ESP_OK)
+    {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No se pudieron guardar las credenciales");
+    }
+    atomic_store(&credentials_saved, true);
+    esp_err_t err = esp_event_post(ROUTER_EVENT, ROUTER_UPDATE_CREDENTIALS, NULL, 0, pdMS_TO_TICKS(100));
+    if (err != ESP_OK)
+    {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Credenciales guardadas; reinicie el equipo para aplicarlas");
+    }
+    ESP_LOGI(TAG_HTTP, "Nuevas credenciales guardadas. Reiniciando conexión STA...");
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/saved");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, NULL, 0);
 }
 
-static void save_wifi_credentials(char *ssid, char *password)
+static esp_err_t save_wifi_credentials(const char *ssid, const char *password)
 {
     nvs_handle_t nvs_handle_wifi;
     esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle_wifi);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_NVS, "Error al abrir el almacenamiento no volátil. Error %s", esp_err_to_name(err));
+        return err;
     }
 
     err = nvs_set_str(nvs_handle_wifi, "ssid", ssid);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG_NVS, "Error al guardar el SSID en el almacenamiento no volátil. Error %s", esp_err_to_name(err));
+        err = nvs_set_str(nvs_handle_wifi, "password", password);
     }
-
-    err = nvs_set_str(nvs_handle_wifi, "password", password);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG_NVS, "Error al guardar la contraseña en el almacenamiento no volátil. Error %s", esp_err_to_name(err));
+        err = nvs_commit(nvs_handle_wifi);
     }
-
-    err = nvs_commit(nvs_handle_wifi);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_NVS, "Error al confirmar los cambios en el almacenamiento no volátil. Error %s", esp_err_to_name(err));
     }
 
     nvs_close(nvs_handle_wifi);
+    return err;
 }
