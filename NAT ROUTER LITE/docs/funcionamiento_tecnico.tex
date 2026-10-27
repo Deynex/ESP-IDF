@@ -1,0 +1,1000 @@
+% Documento autonomo para Overleaf. Compilador: pdfLaTeX.
+% No necesita archivos externos, BibTeX, minted ni shell-escape.
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[spanish,es-tabla,es-nodecimaldot]{babel}
+\usepackage[margin=2.4cm,headheight=15pt]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{booktabs,tabularx,longtable,array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,babel}
+\usepackage{xurl}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!45!black,urlcolor=blue!55!black,
+  citecolor=blue!45!black,pdftitle={NAT Router Lite: funcionamiento y decisiones tecnicas},
+  pdfauthor={Proyecto NAT Router Lite}}
+\definecolor{codebg}{RGB}{245,247,250}
+\lstset{basicstyle=\ttfamily\footnotesize,backgroundcolor=\color{codebg},
+  frame=single,rulecolor=\color{black!15},breaklines=true,
+  columns=fullflexible,keepspaces=true,showstringspaces=false,
+  tabsize=4,aboveskip=1em,belowskip=1em}
+\setlist{itemsep=3pt,topsep=5pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\setlength{\emergencystretch}{2em}
+\renewcommand{\arraystretch}{1.18}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\decision}[1]{\par\textbf{Razón de diseño.} #1\par}
+\title{\textbf{NAT Router Lite}\\[0.4em]
+  \large Funcionamiento, arquitectura y decisiones técnicas}
+\author{Documentación del proyecto}
+\date{Base técnica: ESP-IDF 6.1\\ESP32 y ESP32-S3}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+NAT Router Lite convierte un ESP32 o ESP32-S3 en un router Wi-Fi IPv4
+con configuración mediante navegador. El dispositivo mantiene un punto
+de acceso para sus clientes y una estación conectada al módem, guarda las
+credenciales en NVS y comparte la salida mediante NAPT. Este documento
+describe el código actual, sus interfaces y las razones técnicas de su
+organización: eventos serializados, DNS local estable, confirmación HTTP,
+diagnóstico de errores e indicador configurable. También delimita qué
+comprueba el estado mostrado y qué funciones todavía no existen.
+Las explicaciones de diseño se basan en el comportamiento observable del
+código; no constituyen mediciones de rendimiento.
+\end{abstract}
+\tableofcontents
+\clearpage
+
+\section{Objetivo y recorrido de uso}
+\label{sec:uso}
+
+El objetivo es permitir que uno o varios clientes utilicen la conexión
+Wi-Fi de un módem a través del ESP, sin recompilar cada vez que cambien
+las credenciales del módem. El firmware crea la red \code{ESP32-NAT}, con
+clave inicial \code{12345678}, y expone su aplicación en
+\url{http://192.168.2.1}. El límite configurado es de tres clientes
+asociados al AP. Tanto el ESP32 como el ESP32-S3 de este proyecto trabajan
+con redes de 2,4 GHz.
+
+El primer uso sigue esta secuencia:
+\begin{enumerate}
+  \item El usuario conecta el teléfono al AP del ESP. Si todavía no hay
+  salida a Internet, debe mantener esa conexión para configurar el equipo.
+  \item Abre la dirección HTTP anterior e introduce el SSID y la clave
+  de la red del módem. El botón con un ojo permite mostrar u ocultar la clave.
+  \item El servidor valida y guarda los datos. Una redirección conduce a
+  una página que confirma la recepción y consulta el estado automáticamente.
+  \item El ESP intenta asociarse, obtener una IPv4 y preparar NAPT y DNS.
+  La página muestra espera, un diagnóstico o el estado preparado.
+  \item Al reiniciar, se cargan las credenciales guardadas. Para cambiarlas
+  se utiliza el enlace de la página; no es necesario borrar NVS.
+\end{enumerate}
+
+Guardar datos, conectarse a una red y disponer de Internet son hechos
+distintos. El guardado puede ser correcto aunque la contraseña sea
+incorrecta para ese módem. Una asociación correcta puede carecer de
+IPv4 por un problema DHCP. Incluso con IPv4, NAT y DNS preparados, el
+módem puede haber perdido su servicio de Internet. La aplicación informa
+su estado local y las razones comunicadas por el controlador; no realiza
+una prueba activa contra Google, YouTube u otro servicio externo.
+
+\section{Topología y separación entre control y tráfico}
+\label{sec:topologia}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=blue!45!black,rounded corners,fill=blue!4,
+    minimum height=1.5cm,text width=3.5cm,align=center,font=\small},
+  flow/.style={-{Latex[length=2mm]},thick},node distance=1.15cm]
+  \node[box] (client) {Teléfono / PC\\Cliente del AP\\IPv4 privada por DHCP};
+  \node[box,right=of client] (esp) {ESP32 / ESP32-S3\\AP: 192.168.2.1/24\\STA: IPv4 del módem};
+  \node[box,right=of esp] (modem) {Módem / router\\DHCP y DNS de origen\\Salida a Internet};
+  \draw[flow] (client) -- node[above,font=\small]{Wi-Fi} (esp);
+  \draw[flow] (esp) -- node[above,font=\small]{Wi-Fi} (modem);
+\end{tikzpicture}
+\caption{Dos interfaces lógicas sobre una radio Wi-Fi. Las flechas representan el recorrido de salida.}
+\end{figure}
+
+\textbf{Plano de control.} El navegador habla con el servidor HTTP local,
+que valida formularios, solicita almacenamiento y publica estado. Ese
+intercambio termina en el ESP.
+
+\textbf{Plano de datos.} El tráfico de las aplicaciones del teléfono
+atraviesa lwIP y NAPT hacia la interfaz STA. Los paquetes de YouTube o
+Google no se retransmiten mediante el servidor HTTP del proyecto.
+El proxy DNS sí termina consultas UDP locales y las envía de nuevo al
+servidor DNS seleccionado.
+
+El modo \code{WIFI_MODE_APSTA} mantiene AP y STA simultáneamente. No
+equivale a disponer de dos radios independientes: el canal de la red a
+la que se asocia la STA tiene prioridad y el AP debe acompañarlo
+\cite{wifi}. Por ello, el canal inicial 1 del AP no es una promesa de que
+permanecerá en 1. El cambio de canal puede afectar transitoriamente a
+clientes que no sigan adecuadamente el anuncio del AP.
+
+\decision{APSTA permite conservar el acceso a la configuración mientras
+la conexión al módem falla o se modifica. NAPT permite usar una subred
+propia sin exigir rutas adicionales en el módem. A cambio, el resultado
+es un router de capa IP con traducción de puertos, no un puente
+transparente de capa 2. El rendimiento comparte los recursos de radio,
+CPU y memoria del mismo microcontrolador.}
+
+\section{Organización del código}
+\label{sec:componentes}
+
+\begin{tabularx}{\textwidth}{@{}p{2.7cm}YY@{}}
+\toprule
+Unidad & Responsabilidad & Dependencias propias \\
+\midrule
+\code{main} & Arranque y actualización del indicador & NVS, Wi-Fi, HTTP, LED \\
+\code{nvs} & Leer y guardar credenciales & Ninguna \\
+\code{wifi} & AP, STA, DHCP, eventos, NAPT, reconexión, diagnóstico y parser & NVS, proxy DNS \\
+\code{server} & HTTP y recursos de la aplicación & Wi-Fi y su parser público \\
+\code{dns_proxy} & Reenvío DNS UDP & Ninguna \\
+\code{status_led} & Indicador GPIO o RGB mediante RMT & Ninguna \\
+\bottomrule
+\end{tabularx}
+
+Cada componente declara en CMake las dependencias de ESP-IDF que utiliza.
+Los encabezados públicos están en \code{include/};
+\path{components/wifi/wifi_internal.h} permanece privado. Dentro de Wi-Fi,
+\code{ap.c} configura AP/DHCP, \code{sta.c} configura la estación y
+clasifica fallos, \code{wifi.c} coordina eventos y estado, y
+\code{wifi_form.c} decodifica el formulario.
+
+\path{main/main.c} inicializa LED, NVS, Wi-Fi y servidor en ese orden.
+Después consulta el estado de conexión para actualizar el LED cada
+500 ms. No contiene manejadores HTTP, parser, lógica DNS ni el flujo
+completo de reconexión.
+
+\decision{La división sigue responsabilidades y dependencias, de modo
+que el servidor solicita acciones a Wi-Fi sin manipular sus variables
+internas ni abrir NVS directamente. DNS conserva una tarea y un protocolo
+propios; el LED solo recibe un booleano. Estas fronteras permiten probar
+el parser o el proxy en host y cambiar una presentación sin trasladar
+la lógica de red a la interfaz.}
+
+El almacenamiento expone \code{router_nvs.h}, en lugar de un encabezado
+local llamado \code{nvs.h}. Así se evita ocultar el encabezado homónimo
+del SDK durante la resolución de inclusiones. El namespace y las claves
+no se cambiaron al modularizar: se conserva compatibilidad con las
+credenciales que ya estaban guardadas.
+
+La API pública Wi-Fi incluye \code{router_wifi_start()},
+\code{router_wifi_get_status()}, \code{router_wifi_is_connected()},
+\code{router_wifi_store_credentials()} y
+\code{router_wifi_apply_credentials()}. Guardar y aplicar son operaciones
+separadas: la primera puede fallar en flash; la segunda puede fallar al
+encolar el trabajo. La respuesta HTTP puede distinguir ambas situaciones.
+
+\section{Inicialización y modelo de concurrencia}
+\label{sec:eventos}
+
+El arranque de Wi-Fi realiza las siguientes operaciones:
+\begin{enumerate}
+  \item Crea el temporizador de reconexión antes de habilitar los eventos.
+  \item Inicializa ESP-NETIF, el bucle de eventos y sus manejadores.
+  \item Inicializa el controlador y selecciona APSTA.
+  \item Crea las interfaces AP y STA, configura DHCP y carga credenciales.
+  \item Inicia el listener DNS en la dirección del AP.
+  \item Ejecuta \code{esp_wifi_start()} y espera su retorno correcto.
+  \item Publica \code{ROUTER_CONNECT}; el manejador de eventos inicia
+  entonces la conexión STA.
+\end{enumerate}
+
+El listener DNS existe antes de que un teléfono pueda obtener su primera
+concesión DHCP. Por otra parte, la primera conexión se solicita después
+de que termine \code{esp_wifi_start()}. En las pruebas originales del S3,
+conectar directamente al recibir \code{WIFI_EVENT_STA_START} llegó a
+producir \code{ESP_ERR_WIFI_NOT_STARTED}. La secuencia actual evita esa
+carrera de arranque en este proyecto; no significa que el patrón de
+conectar desde ese evento esté prohibido en todos los programas de IDF.
+
+\subsection{Una tarea coordina las operaciones del controlador}
+
+El callback del temporizador publica un evento \code{ROUTER_CONNECT};
+no ejecuta directamente \code{esp_wifi_connect()}. El manejador HTTP
+publica \code{ROUTER_UPDATE_CREDENTIALS} mediante la API pública. El
+bucle de eventos procesa esas solicitudes y las notificaciones Wi-Fi/IP.
+
+\decision{Serializar las operaciones de conexión, desconexión y cambio
+de configuración reduce carreras entre la tarea HTTP, la tarea del
+temporizador y el controlador. El callback del temporizador queda corto
+y el servidor puede contestar sin esperar toda la asociación. Esto no
+convierte el sistema en un programa de una sola tarea: HTTP, DNS,
+temporizadores, Wi-Fi y lwIP siguen teniendo ejecución concurrente.}
+
+Los indicadores compartidos con HTTP utilizan atómicos C11:
+conectado, credenciales guardadas, NAPT, conflicto y última razón de
+desconexión. Los campos se leen individualmente; la estructura resultante
+no es una fotografía transaccional de todos ellos. Durante una transición
+una consulta puede observar una combinación pasajera que se estabiliza
+en el siguiente sondeo. Las banderas privadas que gobiernan la aplicación
+de credenciales se usan desde la tarea de eventos.
+
+\subsection{Reconexión y actualización de credenciales}
+
+Tras una desconexión se marca la salida como no disponible: se limpia
+el estado de conexión, se deshabilita NAPT y se invalida el DNS de origen.
+Un temporizador de una sola ejecución programa un nuevo intento después
+de tres segundos. A esto se añaden el escaneo de canales y los reintentos
+internos del controlador, configurados con \code{failure_retry_cnt = 2}.
+Tres segundos es el intervalo programado entre intentos de la aplicación,
+no la duración total máxima de una conexión.
+
+Al recibir nuevas credenciales, el flujo es:
+\begin{enumerate}
+  \item Confirmar el guardado en NVS y limpiar el diagnóstico anterior.
+  \item Encolar la actualización, marcar la salida sin servicio y detener
+  el temporizador que pudiera estar pendiente.
+  \item Solicitar desconexión STA, recuperar los datos guardados y aplicar
+  la nueva configuración. Si todavía no se puede, mantener la actualización
+  pendiente para un intento posterior.
+  \item Programar la conexión con la configuración actualizada.
+  \item Al obtener IPv4, preparar la ruta, NAPT y el DNS de origen.
+\end{enumerate}
+
+La desconexión provocada localmente por cambiar claves no debe mostrarse
+como si el módem hubiera rechazado la nueva contraseña. El código reconoce
+las razones de salida local esperadas y evita convertirlas en un fallo
+de autenticación. Un fallo real posterior sí queda registrado.
+
+\code{WIFI_EVENT_STA_CONNECTED} indica asociación, pero el booleano
+\code{connected} se activa al recibir \code{IP_EVENT_STA_GOT_IP}.
+\code{STA_STOP}, \code{STA_DISCONNECTED} y \code{STA_LOST_IP} invalidan
+el estado de salida correspondiente. Si aparece una IP mientras hay un
+cambio de credenciales pendiente, no se presenta como la conexión final
+de esa actualización.
+
+\section{Credenciales: validación y persistencia}
+\label{sec:credenciales}
+
+\subsection{Interpretación correcta del formulario}
+
+El navegador envía \code{ssid} y \code{password} mediante un POST con
+codificación de formulario URL. El servidor acumula todos los fragmentos
+del cuerpo: una lectura de socket no garantiza recibir el mensaje entero.
+Se rechaza un cuerpo vacío, de 320 bytes o más, con NUL embebido o con
+campos inválidos. El búfer de 320 bytes contempla la expansión de cada
+byte a tres caracteres \texttt{\%xx} y la sintaxis de ambos campos.
+
+El parser separa primero los pares por \texttt{\&} y cada clave de su valor
+por \code{=}; después decodifica. Un separador codificado dentro de una
+contraseña debe seguir siendo parte de su valor. Por ejemplo:
+\begin{lstlisting}
+ssid=Mi+red&password=abc%26def%3D123
+# SSID decodificado: Mi red
+# Clave decodificada: abc&def=123
+\end{lstlisting}
+El signo \code{+} significa espacio; \texttt{\%2B} representa un signo más
+literal. Las secuencias incompletas, no hexadecimales o que produzcan
+\texttt{\%00} son inválidas. Los dos campos requeridos deben aparecer una
+sola vez. Las claves desconocidas bien formadas se ignoran; no sustituyen
+a los campos obligatorios.
+
+Se aceptan SSID de 1 a 32 bytes y claves de 8 a 63 bytes, o una PSK de
+64 caracteres hexadecimales. Los búferes de salida tienen 33 y 65 bytes
+para incluir el terminador NUL. Son límites en bytes, no en caracteres
+Unicode: un carácter acentuado puede ocupar más de un byte UTF-8.
+Los atributos HTML ayudan al usuario, pero la validación definitiva se
+realiza en C. No hay un modo de formulario para redes abiertas.
+
+\decision{Validar en el servidor evita depender de un navegador concreto
+o de sus límites de formulario. Separar antes de decodificar conserva
+contraseñas que contienen \texttt{\&}, \code{=} o espacios. El parser es C
+independiente de ESP-IDF y no modifica sus salidas si falla, por lo que
+puede probarse con casos de borde en un ordenador.}
+
+\subsection{Qué se guarda y cuándo se conserva}
+
+El componente NVS utiliza la partición NVS predeterminada, el namespace
+\code{wifi} y las claves de cadena \code{ssid} y \code{password}.
+Abre en lectura/escritura, escribe ambas cadenas y llama a
+\code{nvs_commit()}; solo informa éxito si todas esas operaciones
+devuelven \code{ESP_OK}. Al cargar usa lectura solamente y comprueba
+que las cadenas caben y cumplen las longitudes mínimas esperadas.
+NVS es el almacenamiento de pares clave--valor en flash de ESP-IDF
+\cite{nvs}.
+
+El arranque normal no borra credenciales. La inicialización recupera
+automáticamente la partición mediante borrado únicamente si recibe
+\code{ESP_ERR_NVS_NO_FREE_PAGES} o
+\code{ESP_ERR_NVS_NEW_VERSION_FOUND}. Otros fallos se propagan al arranque.
+Si no hay datos válidos, la STA usa los marcadores \code{SSID}/\code{PASS}
+y el AP permanece disponible para recibir los datos reales. Es posible
+ver avisos de red no encontrada antes de configurar el equipo.
+
+Guardar dos claves y hacer commit no añade por sí mismo una transacción
+de aplicación que garantice una pareja indivisible ante cualquier corte
+de energía o error intermedio. El código actual no utiliza un registro
+versionado ni un único blob que agrupe SSID y clave. Si se necesitara esa
+garantía adicional, habría que diseñar y validar ese formato de persistencia.
+
+\decision{Dos cadenas pequeñas encajan con NVS y conservan compatibilidad
+con los datos de la versión anterior. No se escribe flash en cada sondeo
+de estado ni en cada actualización del LED: se guarda cuando se reciben
+credenciales. La información sensible no se incorpora al JSON de estado
+ni a la página de confirmación.}
+
+\section{IPv4, DHCP y NAPT}
+\label{sec:napt}
+
+El AP tiene dirección y gateway \code{192.168.2.1}, con máscara
+\code{255.255.255.0}. Su servidor DHCP entrega configuración a los
+clientes. La interfaz STA utiliza el DHCP de la red del módem para
+obtener su dirección, máscara, gateway y DNS.
+
+Después de obtener IPv4, el firmware comprueba si las redes AP y STA
+se solapan. Compara las direcciones de ambas interfaces bajo las dos
+máscaras. Por ejemplo, si el módem también utiliza \code{192.168.2.0/24},
+la salida no puede distinguir correctamente esa red del segmento de
+clientes del ESP. También puede existir solapamiento con una máscara
+más amplia aunque los números de subred parezcan distintos.
+
+Cuando detecta conflicto, conserva el dato de que la STA obtuvo IP,
+activa \code{subnet_conflict}, deja NAPT deshabilitado y retira el DNS de
+origen. No cambia automáticamente la IP del AP. Resolverlo requiere
+elegir subredes diferentes y ajustar la configuración de dirección en el
+código; el filtro de clientes DNS usa igualmente una máscara /24.
+
+Si las redes son compatibles, se selecciona la STA como interfaz de
+salida predeterminada y se habilita NAPT sobre el AP mediante
+\code{esp_netif_napt_enable()} \cite{netif}. Los defaults comunes activan:
+\begin{lstlisting}
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_IPV4_NAPT_PORTMAP=y
+\end{lstlisting}
+
+NAPT mantiene traducciones de direcciones y puertos para los flujos de
+salida de los clientes. El módem ve ese tráfico a través de la dirección
+STA del ESP; las respuestas se devuelven al cliente que originó el flujo.
+No se necesita abrir un socket BSD de la aplicación por cada conexión
+reenviada: las traducciones pertenecen a la pila de red. Su tabla y sus
+búferes sí consumen recursos de lwIP.
+
+\decision{Habilitar NAPT únicamente con IPv4 útil evita presentar como
+disponible una salida que todavía no tiene ruta. Deshabilitarlo al perder
+la STA hace coherente el estado publicado. Detectar la superposición
+evita atribuir a una contraseña o al DNS un problema de direccionamiento.}
+
+El soporte de port mapping está compilado, pero la aplicación no crea
+reglas de publicación de puertos ni proporciona una interfaz para ellas.
+Tampoco implementa encaminamiento IPv6. Consultar un registro DNS AAAA
+puede producir una respuesta válida sin que exista conectividad IPv6
+para usarla.
+
+\section{Proxy DNS: la razón del DNS local estable}
+\label{sec:dns}
+
+\subsection{Por qué cambiar el DNS de DHCP no bastaba}
+
+Un teléfono puede asociarse al AP y obtener su concesión DHCP antes de
+que el ESP se conecte al módem. La concesión incluye un servidor DNS que
+el teléfono conserva. Modificar después la configuración del servidor
+DHCP no obliga al teléfono a solicitar una concesión inmediatamente.
+Si la dirección recibida no ofrece un DNS funcional, los dominios fallan
+aunque NAPT ya permita tráfico por dirección IP.
+
+La implementación mantiene una dirección estable: DHCP anuncia desde
+el arranque \code{192.168.2.1} como DNS, y el proxy escucha allí en UDP53
+antes de iniciar la radio. Cuando la STA obtiene conexión, solo cambia
+el servidor al que el proxy reenvía consultas. No se reinicia DHCP para
+intentar sustituir el DNS en concesiones existentes.
+
+\decision{El contrato con el cliente permanece constante durante el
+aprovisionamiento. Esta separación entre DNS anunciado y DNS de origen
+resuelve el caso en que el teléfono solo podía navegar después de apagar
+y encender su Wi-Fi. El cliente conserva gateway y DNS, mientras el ESP
+actualiza su salida internamente.}
+
+\subsection{Selección del servidor de origen}
+
+Al obtener IPv4 se consultan los DNS \code{MAIN}, \code{BACKUP} y
+\code{FALLBACK} de la STA, en ese orden. Se elige el primero que sea IPv4
+y pase las comprobaciones del código: no ser la IP del AP, no pertenecer
+al primer octeto 0 ni 127, y estar por debajo del rango multicast.
+Si ninguno cumple, se utiliza \code{1.1.1.1} y se registra un aviso.
+
+La selección es una búsqueda de configuración válida, no una comprobación
+de disponibilidad. El proxy no cambia automáticamente al segundo DNS
+cuando una consulta expira; tampoco prueba que la red permita alcanzar
+el DNS público de reserva. Una red con DNS interno o restricciones de
+salida puede necesitar ajustes.
+
+\subsection{Recorrido de una consulta}
+
+El proxy usa dos sockets UDP: uno enlazado a la IP del AP y puerto 53,
+y otro conectado al DNS de origen. Una tarea FreeRTOS con pila de
+4096 bytes y prioridad 5 atiende las operaciones mediante \code{select()}.
+
+\begin{enumerate}
+  \item Recibe el datagrama y comprueba su procedencia del segmento AP /24.
+  Valida la cabecera, que sea una consulta ordinaria y que contenga una
+  sola pregunta con nombre y campos dentro de los límites.
+  \item Reserva una de las seis entradas pendientes. Guarda el cliente,
+  su identificador original, la pregunta necesaria para responder con error
+  y el instante de inicio.
+  \item Reemplaza el identificador DNS por uno propio, único entre las
+  entradas activas. El contador inicial parte de \code{esp_random()}.
+  Reenvía el mensaje manteniendo el resto de su contenido.
+  \item Recibe desde el socket asociado al DNS seleccionado y comprueba
+  que sea una respuesta para una transacción pendiente. La estructura de
+  cabecera, ID y códigos de respuesta sigue el formato DNS \cite{dnsrfc}.
+  \item Restaura el identificador original y entrega el mensaje al cliente.
+\end{enumerate}
+
+Dos teléfonos pueden usar el mismo identificador DNS. La reescritura y
+la tabla de pendientes evitan confundirlos, incluso si las respuestas
+llegan en orden inverso. El socket conectado limita la recepción al par
+remoto configurado; la coincidencia de identificador es una comprobación
+de correlación y no sustituye autenticación criptográfica de DNS.
+
+El socket de salida no se enlaza a la IP del AP: utiliza la ruta
+predeterminada STA. Enlazarlo a la dirección de la red de clientes
+introduciría una elección de origen inadecuada para el camino al módem.
+En UDP, \code{connect()} selecciona un par; no realiza un intercambio
+que demuestre que el servidor responde.
+
+\subsection{Límites, errores y cambios de conexión}
+
+\begin{tabularx}{\textwidth}{@{}p{4.5cm}Y@{}}
+\toprule
+Situación & Tratamiento actual \\
+\midrule
+Consulta inválida & Respuesta \code{FORMERR} cuando puede construirse \\
+Sin DNS de origen, tabla llena o fallo de envío & \code{SERVFAIL} \\
+Sin respuesta en dos segundos & Expiración y \code{SERVFAIL} al cliente \\
+Consulta mayor de 4096 bytes & \code{FORMERR} \\
+Respuesta mayor de 4096 bytes & Indicador \code{TC}; sin fallback TCP local \\
+Cambio de DNS o pérdida de STA & Invalida disponibilidad, falla pendientes y recrea el socket de origen \\
+Respuesta con ID desconocido & Se descarta \\
+\bottomrule
+\end{tabularx}
+
+Se usan hasta seis pendientes y un búfer de 4097 bytes para detectar
+mensajes que exceden el máximo aceptado de 4096. El proxy admite preguntas
+ordinarias con nombre sin compresión; no pretende interpretar todas las
+variantes posibles del protocolo. Los datos adicionales aceptados se
+reenvían sin convertir cada tipo de registro a una estructura propia.
+Por eso el transporte puede llevar preguntas A, AAAA o HTTPS sin que
+el firmware tenga que conocer el significado de cada respuesta.
+
+\decision{\code{SERVFAIL} representa indisponibilidad o fallo temporal;
+\code{NXDOMAIN} afirmaría que el dominio no existe y podría dejar una
+respuesta negativa en caché. Los límites fijos acotan memoria y tiempo de
+retención en un microcontrolador. El precio es rechazar carga superior
+a seis pendientes y no cubrir todos los tamaños o transportes de DNS.}
+
+Marcar una respuesta como truncada evita entregar silenciosamente un
+mensaje incompleto. Sin embargo, un cliente que intente continuar por
+TCP en el puerto 53 no encontrará un servidor TCP en el proxy. Es una limitación real
+para respuestas grandes, no una implementación completa de fallback.
+No hay caché DNS, DoH, DoT ni validación DNSSEC propia. Los requisitos
+generales del transporte TCP están descritos en RFC 7766 \cite{dnstcp}.
+
+Los cambios de servidor usan una dirección y un número de generación
+atómicos. \code{dns_ready} exige que el proxy esté iniciado y que el socket
+de origen corresponda a la generación vigente. Así no se conserva un
+estado preparado asociado al DNS de una conexión anterior. La tarea
+revisa actividad con un intervalo de selección de 100 ms y, cuando falla
+la creación del socket de origen, vuelve a intentarla aproximadamente
+cada segundo. Ninguno de esos indicadores demuestra por sí solo salida
+a Internet.
+
+\section{Servidor HTTP y aplicación del navegador}
+\label{sec:http}
+
+\subsection{Recursos y contrato de las rutas}
+
+Las páginas \path{app/main.html} y \path{app/saved.html} se incorporan
+como texto al binario mediante \code{EMBED_TXTFILES}; el favicon se añade
+como binario con \code{EMBED_FILES}. El componente servidor usa los
+símbolos del enlazador para transmitirlos. En los HTML descuenta el NUL
+que añade la incorporación de texto; para el icono transmite el tamaño
+binario completo.
+
+\decision{La aplicación es pequeña y estática. Embebiendo sus recursos
+se evita montar un sistema de archivos, gestionar una partición web o
+distribuir archivos por separado. Los recursos y su API viajan con la
+misma versión del firmware. Cambiar HTML exige recompilar y programar
+esa versión; no existe un cargador de páginas independiente.}
+
+\begin{longtable}{@{}p{3.3cm}p{4.3cm}p{7.3cm}@{}}
+\toprule
+Petición & Respuesta normal & Comportamiento relevante \\
+\midrule
+\endhead
+\code{GET /} & HTML del formulario & Tipo UTF-8, \code{no-cache}, \code{nosniff} \\
+\code{POST /} & \code{303} a \code{/saved} & Valida, guarda y encola aplicación de las credenciales \\
+\code{GET /saved} & HTML de confirmación & \code{no-store}; redirige a \code{/} si no hay credenciales guardadas \\
+\code{GET /api/status} & JSON de estado & \code{no-store}; no incluye SSID ni contraseña \\
+\code{GET /favicon.ico} & Icono & Caché de un año, \code{immutable}, \code{nosniff} \\
+\bottomrule
+\end{longtable}
+
+Un POST inválido produce 400; un timeout al recibir el cuerpo, 408.
+Si no se puede guardar, se responde 500. Si se guardó pero falló la
+publicación del evento de aplicación, también se devuelve 500, con un
+mensaje que distingue que los datos quedaron persistidos y pueden
+aplicarse al reiniciar. La confirmación 303 se envía cuando ambas etapas
+inmediatas tuvieron éxito; no espera a que el módem acepte la contraseña.
+
+\decision{El patrón POST--redirección--GET permite recargar la página de
+confirmación sin volver a enviar las credenciales. Mostrar primero el
+guardado y luego el progreso evita dejar al usuario sin respuesta durante
+el escaneo, DHCP y los reintentos. La autenticación Wi-Fi se informa de
+forma asíncrona mediante la API de estado.}
+
+\subsection{Estado publicado y significado de cada campo}
+
+Una respuesta preparada puede ser:
+\begin{lstlisting}
+{
+  "credentials_saved": true,
+  "connected": true,
+  "nat_enabled": true,
+  "dns_ready": true,
+  "subnet_conflict": false,
+  "wifi_reason": 0,
+  "connection_error": "none"
+}
+\end{lstlisting}
+
+\begin{tabularx}{\textwidth}{@{}p{4.1cm}Y@{}}
+\toprule
+Campo & Interpretación \\
+\midrule
+\code{credentials_saved} & Hay credenciales cargadas válidas o el guardado actual terminó correctamente; no certifica su aceptación por el módem. \\
+\code{connected} & La STA recibió IPv4 y todavía no se invalidó ese estado. \\
+\code{nat_enabled} & La activación de NAPT devolvió éxito. \\
+\code{dns_ready} & Proxy iniciado y socket UDP de origen preparado para la generación actual. \\
+\code{subnet_conflict} & Se detectó superposición de las redes AP y STA. \\
+\code{wifi_reason} & Última razón numérica Wi-Fi registrada, o cero sin diagnóstico vigente. \\
+\code{connection_error} & Categoría estable derivada de esa razón para la interfaz. \\
+\bottomrule
+\end{tabularx}
+
+La condición local de listo combina conexión, NAPT, DNS y ausencia de
+conflicto. No comprueba resolución efectiva en cada sondeo ni acceso a
+un sitio externo. Tampoco hay un watchdog de conectividad global que
+reinicie el dispositivo si el módem conserva Wi-Fi pero pierde Internet.
+
+\subsection{Sondeo automático y presentación}
+
+La página de confirmación consulta la API cada dos segundos durante la
+espera o el error, y cada diez segundos cuando está preparada. Cada
+petición tiene un límite de cinco segundos. Esta periodicidad corresponde
+al navegador que mantiene abierta la página; no es una tarea de
+monitorización adicional que siga ejecutándose dentro del ESP después
+de cerrar la pestaña.
+
+El indicador de carga aparece en espera y desaparece en estado listo,
+error o inactivo. No existe ya un botón de actualización manual.
+Aunque desaparezca la animación al estar preparado, el sondeo más lento
+permite reflejar una pérdida posterior. Un fallo de petición HTTP no
+demuestra por sí solo que la contraseña sea incorrecta. Pasados treinta
+segundos sin un diagnóstico específico se muestra una espera prolongada.
+La preferencia de movimiento reducido del sistema desactiva la animación.
+
+El botón del ojo utiliza SVG en línea, cambia el tipo del campo entre
+\code{password} y \code{text} y actualiza sus atributos accesibles.
+Es un botón de tipo \code{button}, de modo que usarlo no envía el
+formulario. Se desactivan autocorrección, capitalización automática y
+revisión ortográfica para reducir modificaciones involuntarias del dato.
+
+\decision{Sondear un pequeño JSON mantiene sencilla la interacción con
+un servidor embebido y permite verificar el comportamiento en host.
+No requiere WebSocket ni una conexión de eventos permanente. El intervalo
+más largo al estar listo reduce peticiones; separar error de espera evita
+una animación indefinida que esconda el diagnóstico.}
+
+\section{Diagnóstico de asociación y autenticación}
+\label{sec:diagnostico}
+
+El controlador informa razones de desconexión; \code{sta.c} las agrupa
+en categorías que la página transforma en mensajes comprensibles. Los
+códigos representativos siguientes no agotan todos los motivos de cada
+grupo; la tabla completa vigente está en \code{router_wifi_error_for_reason()}.
+
+\begin{longtable}{@{}p{4.8cm}p{2.1cm}p{8cm}@{}}
+\toprule
+Categoría & Ejemplos & Interpretación práctica \\
+\midrule
+\endhead
+\code{none} & 0 & Sin error Wi-Fi registrado en este momento. \\
+\code{network_not_found} & 201 & No se encontró el AP solicitado: revisar SSID, alcance y disponibilidad de la red. \\
+\code{handshake_timeout} & 15, 204 & No terminó el intercambio de claves; una contraseña incorrecta es una causa posible. \\
+\code{authentication_failed} & 202, 23 & Rechazo o fallo de autenticación; revisar clave y seguridad del módem. \\
+\code{authentication_timeout} & 2 & Expiró la fase de autenticación. \\
+\code{security_mismatch} & 210, 211 & Seguridad o cifrado incompatibles con la configuración aceptada. \\
+\code{signal_too_weak} & 212 & No se encontró una red que cumpla el umbral de señal indicado por el controlador. \\
+\code{association_failed} & 203 & Falló la asociación al AP. \\
+\code{modem_busy} & 5 & El AP rechazó más estaciones asociadas. \\
+\code{connection_lost} & 200, 4 & Pérdida de beacons, inactividad u otra salida de la red. \\
+\code{connection_failed} & Otros & Fallo que no pertenece a una categoría más específica. \\
+\bottomrule
+\end{longtable}
+
+No se puede asegurar en todos los equipos que un timeout sea
+exclusivamente una contraseña incorrecta. Interferencias, pérdida de
+tramas o ajustes del módem pueden impedir completar el mismo intercambio.
+La página orienta hacia una causa probable y conserva el código de
+diagnóstico; no inventa una certeza que el controlador no proporciona.
+La ausencia de un mensaje exacto no es una política deliberada de
+ocultar el error por seguridad.
+
+La última razón real permanece durante los reintentos automáticos, en
+lugar de borrarse cada tres segundos y hacer que el mensaje desaparezca.
+Se limpia al guardar nuevas credenciales o al alcanzar una asociación
+correcta. Las salidas locales esperadas al cambiar configuración se
+tratan por separado, como se explicó en la sección~\ref{sec:eventos}.
+
+\decision{Una clasificación estable desacopla la interfaz de decenas de
+constantes del SDK. Conservar razón numérica y categoría permite una
+explicación breve al usuario y un dato más preciso para revisar el log.
+La persistencia temporal del diagnóstico mejora su visibilidad sin
+detener los intentos de recuperación.}
+
+\section{Indicador y opciones específicas del hardware}
+\label{sec:led}
+
+El indicador es seleccionable en el menú \textbf{NAT Router}: sin LED,
+LED GPIO o RGB direccionable. El ESP32 utiliza por defecto GPIO2 activo
+bajo. El perfil S3 utiliza RGB en GPIO48, con brillo inicial 8. En
+ESP32-S3-DevKitC-1 v1.1 el RGB se trasladó a GPIO38; el pin debe ajustarse
+a la revisión física \cite{devkit}.
+
+Sin IPv4 STA, el GPIO parpadea y el RGB parpadea en ámbar. Con IPv4, el
+GPIO permanece encendido y el RGB pasa a verde. La actualización se
+realiza cada 500 ms desde \code{app_main()}: un ciclo encendido/apagado
+completo en desconexión dura aproximadamente un segundo. El LED refleja
+\code{router_wifi_is_connected()}, no las tres condiciones de conexión,
+NAPT y DNS juntas. Puede verse verde aunque el módem no tenga Internet o
+exista conflicto de subred.
+
+\subsection{Por qué se utiliza RMT para el RGB}
+
+El LED direccionable requiere pulsos precisos. El código utiliza el
+controlador RMT de transmisión de ESP-IDF y un copy encoder
+\cite{rmt}; no depende de temporización manual de GPIO dentro de una
+tarea ni de un componente externo de tiras LED. Configura una resolución
+de 10 MHz: cada tick dura 0,1 microsegundos.
+
+Se construyen 24 símbolos para los bits de color en orden GRB y un símbolo
+adicional de reset. Para un cero se generan 3 ticks altos y 9 bajos;
+para un uno, 7 altos y 6 bajos. El reset ocupa 300 microsegundos en bajo.
+Los 25 símbolos caben en los 48 símbolos de memoria de un canal del S3,
+por lo que no se necesita DMA ni rellenar una trama más larga por bloques.
+La cola de transmisión tiene profundidad 1.
+
+La trama se almacena estáticamente para mantener válido el búfer durante
+la transmisión, incluso si se agota la espera. Si el GPIO no es válido,
+falla la reserva del canal o se produce un error de actualización, se
+registra el problema y se desactiva el indicador.
+
+\decision{El LED es una ayuda de observación y su fallo no debe impedir
+el router. RMT proporciona generación de pulsos por hardware mientras
+Wi-Fi y otras tareas están activas. Limitarse a una trama completa pequeña
+reduce la complejidad del codificador y evita exigir DMA solo para un LED.}
+
+\subsection{FTM y consola USB}
+
+El menú incluye un responder FTM opcional, condicionado por la capacidad
+del target y las opciones del SDK. Permite responder a clientes Wi-Fi RTT
+compatibles; está desactivado en los perfiles base. No añade una interfaz
+de medición de distancia ni aumenta la velocidad del router.
+
+El perfil S3 conserva la consola secundaria USB Serial/JTAG. Es una
+opción de observación y depuración del hardware, no una función web ni
+un intérprete de comandos remoto de la aplicación. PSRAM no se activa
+por suponer que todos los módulos S3 la incluyen: debe verificarse el
+módulo y su interfaz física.
+
+\section{Perfiles de ESP-IDF y compilación reproducible}
+\label{sec:configuracion}
+
+\subsection{Chip, placa, defaults y configuración generada}
+
+ESP32 y ESP32-S3 requieren seleccionar targets distintos. Además, un
+mismo chip puede montarse en placas con flash, PSRAM o LED diferentes.
+Los perfiles incluidos son preferencias de las placas del proyecto,
+no una descripción universal de todos los módulos de cada familia.
+
+\begin{tabularx}{\textwidth}{@{}p{5.4cm}Y@{}}
+\toprule
+Archivo & Papel \\
+\midrule
+\path{sdkconfig.defaults} & Forwarding IPv4, NAPT y soporte de port mapping comunes. \\
+\path{sdkconfig.defaults.esp32} & DIO/40 MHz, flash declarada de 2 MB, GPIO2 activo bajo. \\
+\path{sdkconfig.defaults.esp32s3} & DIO/80 MHz, flash de 16 MB, RGB48 y opciones específicas del S3 usado. \\
+\path{sdkconfig} & Configuración activa completa generada por ESP-IDF. \\
+\path{sdkconfig.old} & Respaldo automático previo; no es un perfil permanente de un chip. \\
+\bottomrule
+\end{tabularx}
+
+ESP-IDF carga los defaults comunes y después el sufijo correspondiente a
+\code{IDF_TARGET} \cite{build}. Una selección explícita ya guardada en
+\code{sdkconfig} tiene prioridad sobre defaults. Por eso editar un perfil
+no fuerza necesariamente todos sus valores en una configuración ya
+existente. En IDF 6.1 las opciones con procedencia \texttt{\# default:}
+pueden adoptar nuevos defaults durante la reconfiguración.
+
+El campo \code{CONFIG_IDF_TARGET} identifica el chip de cada configuración
+generada. Al organizar estos perfiles, el archivo raíz activo correspondía
+a \code{esp32} y el respaldo a \code{esp32s3}; esos contenidos pueden
+cambiar al volver a configurar. El significado estable de \code{.old}
+es respaldo, no S3. No deben copiarse configuraciones completas entre
+chips ni editarse manualmente las banderas de capacidades \code{SOC_*}.
+
+El perfil S3 conserva la consola USB secundaria,
+\code{CONFIG_FREERTOS_IN_IRAM}, colores del bootloader y colores del log.
+El tamaño de 16 MB se apoyó en la detección de flash del equipo probado.
+Los 2 MB del perfil ESP32 son el tamaño declarado en su configuración;
+no certifican la capacidad física de cualquier placa ESP32.
+40/80 MHz indican reloj de la memoria flash, no la banda de radio Wi-Fi.
+El tamaño de flash tampoco aumenta por sí mismo la partición de aplicación:
+el esquema de particiones debe revisarse si se requiere una aplicación mayor.
+
+\decision{Los sufijos estándar de ESP-IDF hacen explícitas las diferencias
+de placa sin convertir un respaldo generado en una segunda configuración
+oficial. Mantener lo común en el archivo base reduce divergencias de
+forwarding o NAPT entre chips. Conservar el GPIO configurable evita ligar
+la lógica de red a una revisión concreta del DevKit.}
+
+\subsection{Comandos de trabajo}
+
+Desde una terminal con el entorno ESP-IDF 6.1 activado, el flujo habitual
+consiste en seleccionar un único target, configurar, compilar y programar:
+\begin{lstlisting}
+# Elegir esp32 O esp32s3, segun el chip real.
+idf.py set-target esp32s3
+idf.py menuconfig
+idf.py build
+idf.py -p COM3 flash monitor
+\end{lstlisting}
+\code{COM3} debe reemplazarse por el puerto real. Se sale del monitor
+con \code{Ctrl+]}. \code{set-target} limpia el directorio de compilación
+seleccionado y regenera la configuración; no es un nombre alternativo
+para elegir la placa al programar un binario ya existente. Si el entorno
+define \code{IDF_TARGET}, debe coincidir con el target solicitado.
+
+Para trabajar con ambos chips sin compartir configuración generada ni
+caché, pueden utilizarse carpetas de compilación separadas:
+\begin{lstlisting}
+# PowerShell, desde la raiz del proyecto.
+Remove-Item Env:IDF_TARGET -ErrorAction SilentlyContinue
+
+idf.py -B build/esp32 -D IDF_TARGET=esp32 -D SDKCONFIG=build/esp32/sdkconfig build
+idf.py -B build/esp32s3 -D IDF_TARGET=esp32s3 -D SDKCONFIG=build/esp32s3/sdkconfig build
+
+# Programar especificamente el resultado S3.
+idf.py -B build/esp32s3 -D IDF_TARGET=esp32s3 -D SDKCONFIG=build/esp32s3/sdkconfig -p COM3 flash monitor
+\end{lstlisting}
+Las mismas opciones deben acompañar a \code{menuconfig}, \code{build},
+\code{flash} y \code{monitor}. Si una carpeta tiene caché de otro target
+o de otra ruta \code{SDKCONFIG}, debe elegirse una carpeta nueva o
+regenerarla de forma consciente.
+
+\code{idf.py save-defconfig} escribe por defecto en el archivo raíz
+\code{sdkconfig.defaults}; no distribuye automáticamente las opciones
+entre los dos sufijos. Antes de conservar sus resultados deben separarse
+preferencias comunes y de placa. La guía \path{CONFIGURACION.md} contiene
+los comandos de mantenimiento y las comprobaciones de los perfiles.
+
+\section{Presupuesto de recursos y tratamiento de fallos}
+\label{sec:recursos}
+
+Con la configuración revisada, lwIP tiene diez sockets disponibles.
+El servidor fija cuatro sesiones HTTP abiertas como máximo y admite
+purga de la sesión menos recientemente usada. Según la reserva interna
+del servidor de IDF, se presupuestan tres sockets adicionales de HTTP;
+el proxy usa dos. El total presupuestado es por tanto
+\(4 + 3 + 2 = 9\), dentro del límite de diez.
+
+\decision{Dejar el máximo HTTP predeterminado sin tener en cuenta DNS
+podría agotar los sockets al iniciar ambos servicios. El límite de cuatro
+sesiones y la purga LRU equilibran conexiones de navegador y el servicio
+DNS. No representa cuatro clientes Wi-Fi: una sola pestaña puede utilizar
+más de una conexión HTTP y el AP mantiene su límite independiente de tres
+estaciones.}
+
+Las seis entradas DNS y el búfer de paquetes son estáticos y pertenecen
+a la tarea DNS. Evitan alojar el paquete de unos 4 KB en su pila de 4 KB.
+Entre paquete y tabla pendiente se reserva del orden de 6 KB estáticos,
+además de la pila de tarea. Esto es una estimación de esas estructuras,
+no el consumo total de RAM: faltan TCB, sockets, pbufs, controlador
+Wi-Fi, servidor, otras tareas y alineación. La disponibilidad real se
+comprueba en el mapa de enlace y las métricas de heap.
+
+El servidor reserva ocho posiciones de URI y registra cinco rutas.
+Los recursos HTML ocupan flash del firmware y se sirven desde sus
+símbolos embebidos. El código no impone una tarea ni una conexión nueva
+por cada flujo NAPT, pero los límites internos de la pila siguen
+condicionando la carga posible.
+
+Los fallos se manejan según su importancia:
+\begin{itemize}
+  \item La inicialización imprescindible de NVS, red y listener DNS usa
+  comprobaciones de error que pueden detener el arranque ante un fallo.
+  \item La pérdida del módem activa recuperación por eventos y temporizador,
+  conservando el AP para corregir la configuración.
+  \item Un fallo al iniciar HTTP se registra; no hay actualmente un
+  supervisor que reintente automáticamente el arranque de ese servidor.
+  \item Un error del LED desactiva el indicador y deja continuar la red.
+\end{itemize}
+
+\section{Seguridad y alcance real de la aplicación}
+\label{sec:seguridad}
+
+La seguridad del enlace inalámbrico y la administración web son capas
+distintas. El AP utiliza \code{WIFI_AUTH_WPA3_PSK} cuando se compila con
+\code{CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT}; en caso contrario utiliza
+\code{WIFI_AUTH_WPA2_PSK}. En ambos casos el código requiere PMF. No es
+un modo mixto automático WPA2/WPA3 para todos los clientes. La STA fija
+un umbral mínimo WPA2 y \code{WPA3_SAE_PWE_BOTH}. Un cliente antiguo sin
+la seguridad o PMF necesarios puede no asociarse.
+
+El servidor usa HTTP en puerto80, sin inicio de sesión propio, HTTPS
+ni protección CSRF implementada por la aplicación. No se enlaza
+exclusivamente a la dirección AP; puede resultar accesible también por
+la dirección STA desde la red del módem, según el acceso que permita
+esa red. Poder alcanzar la interfaz HTTP permite enviar credenciales
+nuevas; la contraseña del AP no es una autenticación administrativa
+adicional para solicitudes que lleguen por otros caminos.
+
+Los perfiles no habilitan cifrado de NVS ni de flash. Guardar una cadena
+en NVS aporta persistencia, no confidencialidad frente a lectura física
+de la memoria. El firmware evita imprimir contraseñas en sus mensajes
+propios y la API no las publica, pero no incorpora un sistema de gestión
+de secretos, borrado seguro de todos los búferes temporales o control de
+acceso por usuario. La clave del AP inicial es conocida y está definida
+en \path{components/wifi/wifi_internal.h}.
+
+El listener DNS sí está enlazado a la IP del AP y filtra procedencias
+de su /24. Estas comprobaciones limitan su alcance, pero no equivalen
+a DNS autenticado. La reescritura de IDs sirve para correlacionar
+transacciones; no convierte el protocolo en DNS cifrado.
+
+Como futuras mejoras, podrían evaluarse autenticación administrativa,
+restricción de interfaces HTTP, protección de solicitudes de cambio,
+cifrado de almacenamiento con aprovisionamiento de claves y un formato
+versionado de credenciales. También pueden estudiarse DNS por TCP y
+failover de origen. Son propuestas, no funciones incluidas ni garantías
+de esta versión. OTA tampoco está implementado.
+
+\section{Verificación y diagnóstico práctico}
+\label{sec:verificacion}
+
+\subsection{Qué evidencia existe}
+
+Las validaciones registradas en el proyecto tienen alcances diferentes:
+\begin{itemize}
+  \item \textbf{Compilación por target.} Se generaron configuraciones
+  nuevas para ESP32 y ESP32-S3 con ESP-IDF 6.1 y se compilaron los dos
+  perfiles. Esto comprueba dependencias, símbolos, selección de target
+  y enlace de recursos. No equivale a programar ambas placas en cada revisión.
+  \item \textbf{Parser en host.} Se compila el C de producción y se prueban
+  límites, UTF-8, escapes, duplicados y entradas inválidas.
+  \item \textbf{DNS en host.} El código de producción se adapta a sockets
+  del host y se prueban siete escenarios con UDP real en loopback, puerto
+  de prueba 1053: sin origen, preservación del mensaje, clientes con igual
+  ID y respuestas invertidas, cambio de origen, respuesta desconocida,
+  expiración y nueva pérdida de origen. El firmware usa el puerto 53.
+  \item \textbf{Interfaz en host.} Se ejecuta el JavaScript real de la
+  confirmación con DOM y peticiones simuladas: errores, reintentos, nuevas
+  credenciales, recuperación y respuestas de estado inválidas.
+  \item \textbf{Pruebas manuales reportadas en S3.} Se verificaron primer
+  guardado, navegación desde el AP, SSID erróneo, contraseña errónea,
+  recuperación con datos correctos y reinicio conservando NVS.
+\end{itemize}
+
+Los comandos se encuentran en \path{tests/README.md}. Las pruebas de host
+no emulan el controlador de radio, DHCP de lwIP, NAPT real ni el
+comportamiento de todos los teléfonos. No hay aquí una medición de
+throughput, latencia, consumo, carga máxima con tres estaciones o
+estabilidad durante días. No debe deducirse una cifra de rendimiento
+del éxito de compilación ni de una navegación manual.
+
+\subsection{Orden útil para localizar un problema}
+
+\begin{enumerate}
+  \item \textbf{Acceso local.} Comprobar asociación a \code{ESP32-NAT},
+  dirección obtenida por DHCP y acceso explícito por HTTP a
+  \code{192.168.2.1}. No se implementa una redirección universal de portal
+  cautivo ni una captura general de todos los dominios.
+  \item \textbf{Credenciales.} Confirmar que se recibió la página de
+  guardado y revisar \code{connection_error}/\code{wifi_reason}. Un error
+  201 orienta a red no encontrada; 15/204, al intercambio de claves.
+  \item \textbf{Dirección de salida.} Revisar \code{connected} y el log de
+  IPv4. Asociación sin IP sugiere revisar DHCP antes de atribuirlo a NAPT.
+  \item \textbf{Redes diferentes.} Revisar \code{subnet_conflict}; corregir
+  la superposición antes de probar DNS o navegación.
+  \item \textbf{NAPT y resolución.} Revisar \code{nat_enabled} y
+  \code{dns_ready}. Si una dirección externa es accesible pero los nombres
+  no resuelven, estudiar el DNS de origen y sus restricciones.
+  \item \textbf{Servicio del módem.} Si todo lo local está preparado,
+  comprobar que la red del módem realmente tenga Internet. Un LED verde
+  no descarta una falla del proveedor.
+\end{enumerate}
+
+Un \code{ECONNRESET} HTTP puede ser el cierre de una sesión por parte del
+navegador; por sí solo no demuestra caída Wi-Fi. En cambio, las razones
+de desconexión del controlador y los eventos IP permiten relacionar un
+fallo de radio con el estado de salida. No se necesita borrar NVS como
+paso rutinario de diagnóstico: hacerlo elimina la persistencia que se
+pretende verificar.
+
+\section{Cómo generar y mantener este documento}
+
+Este archivo es autónomo. En Overleaf se crea un proyecto en blanco,
+se sube \code{funcionamiento_tecnico.tex} y se selecciona como documento
+principal, o se copia su contenido en \code{main.tex}. El compilador
+debe ser \textbf{pdfLaTeX}. Diagramas, tablas y referencias están dentro
+del mismo archivo. No se requieren imágenes externas, BibTeX,
+\code{minted} ni ejecución de comandos externos. Una segunda compilación
+actualiza índice y referencias cruzadas si la herramienta no la realiza
+automáticamente.
+
+Para mantenerlo alineado con el firmware, revisar especialmente
+\path{components/wifi/wifi_internal.h}, \path{components/wifi/wifi.c},
+\path{components/wifi/sta.c}, \path{components/wifi/ap.c},
+\path{components/server/server.c}, \path{components/dns_proxy/dns_proxy.c},
+\path{components/nvs/nvs.c}, \path{components/status_led/status_led.c},
+\path{app/saved.html} y los tres archivos de defaults. El README raíz
+es la guía de uso; este informe explica mecanismos y decisiones. Los
+comentarios y nombres citados deben actualizarse cuando cambien los
+contratos públicos, límites o condiciones de disponibilidad.
+
+Las referencias siguientes describen las APIs y protocolos de soporte;
+la autoridad para los valores y funciones específicas de la aplicación
+es su código fuente. Las páginas de documentación \code{latest} pueden
+evolucionar; las compilaciones documentadas aquí corresponden a ESP-IDF 6.1.
+
+\begin{thebibliography}{9}
+\bibitem{wifi} Espressif Systems.
+\emph{ESP32-S3 Wi-Fi Driver: Overview, configuración y canal compartido APSTA.}
+\url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/wifi-driver/overview.html}
+
+\bibitem{netif} Espressif Systems.
+\emph{ESP-NETIF Programmer's Manual: direccionamiento, DHCP y NAPT.}
+\url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/network/esp_netif_programming.html}
+
+\bibitem{nvs} Espressif Systems.
+\emph{Non-Volatile Storage Library.}
+\url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/storage/nvs_flash.html}
+
+\bibitem{rmt} Espressif Systems.
+\emph{Remote Control Transceiver (RMT).}
+\url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/rmt.html}
+
+\bibitem{devkit} Espressif Systems.
+\emph{ESP32-S3-DevKitC-1 v1.1 User Guide: diferencias de revisión y LED.}
+\url{https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html}
+
+\bibitem{build} Espressif Systems.
+\emph{Build System: Target-dependent sdkconfig defaults.}
+\url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html#target-dependent-sdkconfig-defaults}
+
+\bibitem{dnsrfc} P. Mockapetris.
+\emph{RFC1035: Domain Names---Implementation and Specification.}
+Estructura de mensajes, identificadores, errores y truncamiento DNS.
+\url{https://www.rfc-editor.org/rfc/rfc1035.html}
+
+\bibitem{dnstcp} J. Dickinson et al.
+\emph{RFC7766: DNS Transport over TCP---Implementation Requirements.}
+Referencia para el transporte TCP que este proxy todavía no implementa.
+\url{https://www.rfc-editor.org/rfc/rfc7766.html}
+\end{thebibliography}
+
+\end{document}
