@@ -120,6 +120,19 @@
         let pollTimer;
         let inFlight = false;
 
+        const connectionErrors = {
+            handshake_timeout: ['No se pudo validar la contraseña', 'La verificación de la clave agotó el tiempo de espera. La contraseña puede ser incorrecta. Usa «Cambiar credenciales» para revisarla. El ESP seguirá reintentando.'],
+            authentication_failed: ['Error de autenticación', 'No se pudo autenticar el ESP con el módem. Revisa la contraseña y la seguridad de la red. El ESP seguirá reintentando.'],
+            authentication_timeout: ['El módem no respondió a la autenticación', 'Se agotó el tiempo de espera al autenticar el ESP. Comprueba que el módem esté encendido y que la señal llegue bien. El ESP seguirá reintentando.'],
+            network_not_found: ['Red Wi-Fi no encontrada', 'Comprueba el nombre de la red (SSID), que el módem esté encendido y que esté dentro del alcance. El ESP seguirá buscando la red.'],
+            security_mismatch: ['Seguridad Wi-Fi incompatible', 'La seguridad de la red no es compatible con la configuración WPA2/WPA3 del ESP. Revisa la configuración del módem.'],
+            signal_too_weak: ['Señal Wi-Fi insuficiente', 'Acerca el ESP al módem o evita obstáculos entre ambos. El ESP seguirá intentando conectarse.'],
+            association_failed: ['El módem no aceptó la conexión', 'La red fue encontrada, pero no se pudo asociar el ESP. Revisa si el módem restringe el acceso de dispositivos. El ESP seguirá reintentando.'],
+            modem_busy: ['Módem sin conexiones disponibles', 'El módem alcanzó su límite de dispositivos conectados. Libera una conexión o revisa ese límite. El ESP seguirá reintentando.'],
+            connection_lost: ['Se perdió la conexión con el módem', 'Comprueba que el módem siga encendido y dentro del alcance. El ESP intentará reconectarse automáticamente.'],
+            connection_failed: ['No se pudo completar la conexión', 'El ESP no pudo establecer la conexión con el módem. Revisa la red y las credenciales. Se volverá a intentar automáticamente.']
+        };
+
         function showStatus(state, title, text) {
             statusBox.dataset.state = state;
             statusTitle.textContent = title;
@@ -139,7 +152,9 @@
                 if (!response.ok) throw new Error('Status request failed');
                 const status = await response.json();
                 const fields = ['credentials_saved', 'connected', 'nat_enabled', 'dns_ready', 'subnet_conflict'];
-                if (!fields.every(field => typeof status[field] === 'boolean')) throw new Error('Invalid status');
+                if (!fields.every(field => typeof status[field] === 'boolean') ||
+                    !Number.isInteger(status.wifi_reason) || status.wifi_reason < 0 ||
+                    typeof status.connection_error !== 'string') throw new Error('Invalid status');
 
                 if (!status.credentials_saved) {
                     document.getElementById('confirmation-title').textContent = 'Configura tu red Wi-Fi';
@@ -148,8 +163,12 @@
                     nextPoll = 10000;
                 } else if (status.subnet_conflict) {
                     showStatus('error', 'Las redes coinciden', 'La red del módem coincide con la del ESP. Cambia la red del punto de acceso.');
+                } else if (!status.connected && status.connection_error !== 'none') {
+                    const error = Object.prototype.hasOwnProperty.call(connectionErrors, status.connection_error)
+                        ? connectionErrors[status.connection_error] : connectionErrors.connection_failed;
+                    showStatus('error', error[0], error[1]);
                 } else if (!status.connected) {
-                    if (waitingSince === null) waitingSince = Date.now();
+                    if (waitingSince === null || statusBox.dataset.state === 'error') waitingSince = Date.now();
                     const takingLonger = Date.now() - waitingSince >= 30000;
                     showStatus('waiting', takingLonger ? 'La conexión sigue pendiente' : 'Conectando al módem…',
                         takingLonger

@@ -58,7 +58,9 @@ static atomic_bool esp_connected = false;
 static atomic_bool credentials_saved = false;
 static atomic_bool nat_enabled = false;
 static atomic_bool subnet_conflict = false;
+static atomic_uint wifi_disconnect_reason = 0;
 static bool credentials_pending = false; // Solo se accede desde la tarea de eventos.
+static bool credentials_disconnect_expected = false;
 static httpd_handle_t server_handle = NULL;
 
 // Declaración de funciones principales
@@ -115,12 +117,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     {
         if (event_id == ROUTER_UPDATE_CREDENTIALS)
         {
+            atomic_store(&wifi_disconnect_reason, 0);
             router_mark_offline();
             esp_timer_stop(reconnect_timer);
             credentials_pending = true;
+            credentials_disconnect_expected = true;
             esp_err_t err = esp_wifi_disconnect();
             if (err != ESP_OK)
             {
+                credentials_disconnect_expected = false;
                 ESP_LOGW(TAG_STA, "Desconexión para actualizar credenciales: %s", esp_err_to_name(err));
             }
             if (err == ESP_OK)
@@ -133,7 +138,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         {
             if (credentials_pending)
             {
+                credentials_disconnect_expected = true;
                 esp_err_t err = esp_wifi_disconnect();
+                if (err != ESP_OK)
+                {
+                    credentials_disconnect_expected = false;
+                }
                 if (err != ESP_OK || !update_wifi_credentials())
                 {
                     wifi_reconnect();
@@ -143,6 +153,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 wifi_reconnect();
                 return;
             }
+            // El siguiente fallo ya pertenece al intento con la configuración actual.
+            credentials_disconnect_expected = false;
             esp_err_t err = esp_wifi_connect();
             if (err != ESP_OK)
             {
@@ -193,6 +205,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             break;
         case WIFI_EVENT_STA_CONNECTED:
         {
+            atomic_store(&wifi_disconnect_reason, 0);
+            credentials_disconnect_expected = false;
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
             ESP_LOGI(TAG_STA, "Conectado a la red. MAC: " MACSTR ", AID: %d", MAC2STR(event->bssid), event->aid);
             if (!credentials_pending)
@@ -205,6 +219,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         {
             wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG_STA, "Desconectado de la red o fallo en conexión. MAC: " MACSTR ", Razon: %d", MAC2STR(event->bssid), event->reason);
+            // Cambiar credenciales provoca una desconexión local, no un rechazo de clave.
+            bool local_update = credentials_disconnect_expected &&
+                (event->reason == WIFI_REASON_STA_LEAVING || event->reason == WIFI_REASON_ASSOC_LEAVE);
+            credentials_disconnect_expected = false;
+            if (!local_update)
+            {
+                atomic_store(&wifi_disconnect_reason, event->reason);
+            }
             router_mark_offline();
 
             sta_disconnected_event_handler(event);
@@ -236,6 +258,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 break;
             }
             ESP_LOGI(TAG_STA, "Dirección IP asignada. IP: " IPSTR ", Máscara: " IPSTR ", Gateway: " IPSTR, IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask), IP2STR(&event->ip_info.gw));
+            atomic_store(&wifi_disconnect_reason, 0);
             atomic_store(&esp_connected, true);
             esp_timer_stop(reconnect_timer);
 
@@ -805,16 +828,64 @@ static esp_err_t saved_handler(httpd_req_t *req)
     return httpd_resp_send(req, (const char *)saved_html_start, saved_html_end - saved_html_start - 1);
 }
 
+static const char *wifi_connection_error(unsigned reason)
+{
+    switch (reason)
+    {
+    case 0:
+        return "none";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "handshake_timeout";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+    case WIFI_REASON_MIC_FAILURE:
+    case WIFI_REASON_INVALID_PMKID:
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+        return "authentication_failed";
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "authentication_timeout";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "network_not_found";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+    case WIFI_REASON_GROUP_CIPHER_INVALID:
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+    case WIFI_REASON_AKMP_INVALID:
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+    case WIFI_REASON_INVALID_RSN_IE_CAP:
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:
+    case WIFI_REASON_BAD_CIPHER_OR_AKM:
+        return "security_mismatch";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return "signal_too_weak";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "association_failed";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "modem_busy";
+    case WIFI_REASON_BEACON_TIMEOUT:
+    case WIFI_REASON_AUTH_LEAVE:
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
+    case WIFI_REASON_ASSOC_LEAVE:
+    case WIFI_REASON_STA_LEAVING:
+        return "connection_lost";
+    default:
+        return "connection_failed";
+    }
+}
+
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char response[192];
+    char response[320];
+    unsigned reason = atomic_load(&wifi_disconnect_reason);
     snprintf(response, sizeof(response),
-             "{\"credentials_saved\":%s,\"connected\":%s,\"nat_enabled\":%s,\"dns_ready\":%s,\"subnet_conflict\":%s}",
+             "{\"credentials_saved\":%s,\"connected\":%s,\"nat_enabled\":%s,\"dns_ready\":%s,\"subnet_conflict\":%s,\"wifi_reason\":%u,\"connection_error\":\"%s\"}",
              atomic_load(&credentials_saved) ? "true" : "false",
              atomic_load(&esp_connected) ? "true" : "false",
              atomic_load(&nat_enabled) ? "true" : "false",
              dns_proxy_is_ready() ? "true" : "false",
-             atomic_load(&subnet_conflict) ? "true" : "false");
+             atomic_load(&subnet_conflict) ? "true" : "false",
+             reason, wifi_connection_error(reason));
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, response);
@@ -854,6 +925,7 @@ static esp_err_t post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No se pudieron guardar las credenciales");
     }
     atomic_store(&credentials_saved, true);
+    atomic_store(&wifi_disconnect_reason, 0);
     esp_err_t err = esp_event_post(ROUTER_EVENT, ROUTER_UPDATE_CREDENTIALS, NULL, 0, pdMS_TO_TICKS(100));
     if (err != ESP_OK)
     {
